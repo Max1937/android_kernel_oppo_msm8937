@@ -1,0 +1,4 @@
+config FINGERPRINT_GOODIX_GF3208_VINCE
+	tristate "goodix fingerprint gf3208 (vince)"
+	help
+	  Say Y here to enable goodix fingerprint driver support!
