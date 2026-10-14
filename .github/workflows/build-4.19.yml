@@ -65,6 +65,14 @@ jobs:
       build_date: ${{ steps.gen.outputs.BUILD_DATE }}
       publish: ${{ steps.gen.outputs.publish }}
     steps:
+      # push 事件要从仓库里的 ci/targets 决定构建目标，所以 setup 必须 checkout。
+      # 只拉最近一次提交即可，不需要完整历史。
+      - name: 检出（用于读取 ci/targets）
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Generate matrix
         id: gen
         run: |
