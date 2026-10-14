@@ -1364,4 +1364,7 @@ config TOUCHSCREEN_DOUBLETAP2WAKE
 	bool "DoubleTap2Wake for touchscreens"
 	default n
 
+source "drivers/input/touchscreen/oppo_touchscreen/Kconfig"
+source "drivers/input/touchscreen/synaptics_oppo/Kconfig"
+
 endif

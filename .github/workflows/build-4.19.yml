@@ -86,18 +86,27 @@ jobs:
           python3 - "${WANT}" <<'PYEOF' > matrix.json
           import json, os, sys, subprocess
 
+          # 注意：mi8953.config 是**必需**片段，不是可选的小米附加功能。
+          # drivers/power/supply/qcom/qpnp-fg.c:8033 在没有
+          # IS_ENABLED(CONFIG_MACH_XIAOMI_MSM8953) 保护的情况下直接调用
+          # xiaomi_msm8953_mach_get() / XIAOMI_MSM8953_MACH_*，所以
+          # 不合并 mi8953.config（即 CONFIG_MACH_XIAOMI_MSM8953=y）时基线
+          # 自身就编不过（-Werror=implicit-function-declaration）。
+          # 本仓库面向 OPPO，不启用任何 Xiaomi 机型，但该符号仍必须为 y，
+          # 让 qpnp-fg 走 xiaomi_msm8953_mach_get() 返回 UNKNOWN 的分支。
+          BASE_FRAGMENTS = "vendor/mi8953.config"
           targets = [
             {
               "target": "base", "label": "4.19 base smoke",
               "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": "",
+              "fragments": BASE_FRAGMENTS,
               "device_names": "", "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": False,
             },
             {
               "target": "R9s", "label": "R9s",
               "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": "vendor/oppo-16017.config",
+              "fragments": BASE_FRAGMENTS + " vendor/oppo-16017.config",
               "device_names": "r9s|R9s|16017|16027|msm8953",
               "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": True,

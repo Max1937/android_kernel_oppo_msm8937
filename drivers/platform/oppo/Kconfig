@@ -1,0 +1,41 @@
+# OPPO configuration options
+#
+# 4.19 适配说明：
+#   4.9 树里 MACH_OPPO 依赖 ARCH_MSM，而 4.19 基线（LineageOS sdm660 +
+#   CIP 统一 MSM8953）没有 ARCH_MSM 这个笼统符号，只有具体的
+#   ARCH_MSM8953 / ARCH_MSM8937 / ARCH_SDM450 等。
+#   同理 ARCH_MSM8940（A57）与 ARCH_MSM8976（R9s Plus / R9 Plus）在 4.19
+#   基线里并不存在，所以这里只保留 4.19 能真实支持的板子。
+#   要再做 MSM8976 / MSM8940 机型，需要先把对应 SoC 支持从 4.9 移植过来
+#   （工作量大，且不属于本次 R9s 升级的目标）。
+
+config MACH_OPPO
+	bool "OPPO device"
+	depends on ARCH_MSM8953 || ARCH_MSM8937 || ARCH_SDM450
+	help
+	  Support for OPPO products
+
+config MACH_OPPO_MSM8953
+	bool "OPPO MSM8953"
+	depends on ARCH_MSM8953
+	select MACH_OPPO
+	help
+	  Support for MSM8953 OPPO variants
+
+menu "OPPO board selection"
+
+config MACH_16017
+	bool "R9s board"
+	depends on ARCH_MSM8953
+	select MACH_OPPO_MSM8953
+	help
+	  Support for R9s variants
+
+config MACH_16027
+	bool "R9sk board"
+	depends on ARCH_MSM8953
+	select MACH_OPPO_MSM8953
+	help
+	  Support for R9sk variants
+
+endmenu
