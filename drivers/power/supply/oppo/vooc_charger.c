@@ -63,7 +63,7 @@ void vooc_chip_send_reply(struct oppo_vooc_device *vooc, int reply_info)
 
 static void vooc_poll_func(struct work_struct *work)
 {
-	int i, data, bit;
+	int i, data = 0, bit;
 	int chip_reply_info = 2; // FIXME: May also be returning 1
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct oppo_vooc_device *vooc = container_of(dwork,
@@ -103,14 +103,14 @@ static void vooc_poll_func(struct work_struct *work)
 		break;
 	case VOOC_NOTIFY_ALLOW_READING_IIC:
 		// TODO: Investigate whatever this does
-		dev_info(dev, "chip reported to allowing reading i2c\n",
+		dev_info(dev, "chip reported to allowing reading i2c, data: 0x%x, fw version: 0x%x\n",
 			 data, vooc->fw_data_version);
 		break;
 	case VOOC_NOTIFY_LOW_TEMP_FULL:
 	case VOOC_NOTIFY_BAD_CONNECTED:
 	case VOOC_NOTIFY_TEMP_OVER:
 	case VOOC_NOTIFY_BTB_TEMP_OVER:
-		dev_err(dev, "chip reported error, data: 0x%x\n",
+		dev_err(dev, "chip reported error, data: 0x%x, fw version: 0x%x\n",
 			data, vooc->fw_data_version);
 	case VOOC_NOTIFY_NORMAL_TEMP_FULL:
 		vooc_set_fast_charge_enabled(vooc, false);
@@ -118,7 +118,7 @@ static void vooc_poll_func(struct work_struct *work)
 	case VOOC_NOTIFY_FIRMWARE_UPDATE:
 	case VOOC_NOTIFY_ADAPTER_FW_UPDATE:
 		// TODO: Implement firmware update
-		dev_info(dev, "chip reported for fw update\n",
+		dev_info(dev, "chip reported for fw update, data: 0x%x, fw version: 0x%x\n",
 			data, vooc->fw_data_version);
 		break;
 	default:
