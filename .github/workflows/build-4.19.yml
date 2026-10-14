@@ -239,22 +239,33 @@ jobs:
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           )
 
-          echo "::group::Make defconfig"
-          make "${MAKEFLAGS[@]}" "${DEFCONFIG}"
+          echo "::group::Make defconfig + config fragments"
+          # 一次性把主 defconfig 与所有片段交给 make。
+          # 为什么不自己调 scripts/kconfig/merge_config.sh：
+          #   merge_config.sh 的 OUTPUT 默认是 '.'，写入的是**当前目录**的
+          #   .config。在 O=out 之外再手工调用它，会在源码树里留下
+          #   kernel/.config；随后 prepare3 检测到 $(srctree)/.config 存在，
+          #   直接报 ".. is not clean, please run 'make mrproper'" 并失败。
+          # 而 make 自带的 %.config 规则会把 merge 结果写到 $(KCONFIG_CONFIG)
+          # （O= 时即 out/.config），源码树保持干净。
+          # -j1 + 按顺序列出，保证 defconfig 先于片段生效。
+          CONFIGS=("${DEFCONFIG}")
+          for frag in ${FRAGMENTS}; do
+            if [ ! -f "arch/arm64/configs/${frag}" ]; then
+              echo "::error::config 片段不存在: arch/arm64/configs/${frag}"
+              exit 1
+            fi
+            CONFIGS+=("${frag}")
+          done
+          echo "configs: ${CONFIGS[*]}"
+          make "${MAKEFLAGS[@]}" -j1 "${CONFIGS[@]}"
           echo "::endgroup::"
 
-          # ---- 追加 config 片段（OPPO 机型差异）----
-          if [ -n "${FRAGMENTS}" ]; then
-            for frag in ${FRAGMENTS}; do
-              if [ ! -f "arch/arm64/configs/${frag}" ]; then
-                echo "::error::config 片段不存在: arch/arm64/configs/${frag}"
-                exit 1
-              fi
-              echo "::group::Merge fragment ${frag}"
-              ./scripts/kconfig/merge_config.sh -m out/.config "arch/arm64/configs/${frag}"
-              make "${MAKEFLAGS[@]}" olddefconfig
-              echo "::endgroup::"
-            done
+          # 断言源码树没有被 config 步骤污染（否则 prepare3 必失败）
+          if [ -e .config ] || [ -d include/config ]; then
+            echo "::error::源码树被污染：.config 或 include/config 出现在 srctree"
+            ls -la .config include/config 2>/dev/null || true
+            exit 1
           fi
 
           echo "::group::Make Image.gz-dtb"
