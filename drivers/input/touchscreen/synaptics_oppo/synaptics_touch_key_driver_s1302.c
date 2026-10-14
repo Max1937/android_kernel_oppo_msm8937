@@ -21,7 +21,7 @@
 #include <linux/delay.h>
 #include <linux/sysfs.h>
 #include <linux/input.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/proc_fs.h>
@@ -1353,7 +1353,7 @@ static ssize_t synaptics_rmi4_baseline_show_s1302(struct device *dev, char *buf,
 		old_fs = get_fs();
 		set_fs(KERNEL_DS);
 
-		fd = sys_open(data_buf, O_WRONLY | O_CREAT | O_TRUNC, 0);
+		fd = ksys_open(data_buf, O_WRONLY | O_CREAT | O_TRUNC, 0);
 		if (fd < 0) {            
 			TPD_ERR("Open log file '%s' failed.\n", data_buf);
 			set_fs(old_fs);
@@ -1380,7 +1380,7 @@ static ssize_t synaptics_rmi4_baseline_show_s1302(struct device *dev, char *buf,
 		error_count++;
 		num_read_chars += sprintf(&(buf[num_read_chars]), "eint_status is low, TP EINT direct stort,\n");
 		sprintf(&eint_buf[0], "eint_status is low, TP EINT direct stort,\n");
-              	sys_write(fd, eint_buf, strlen(eint_buf));
+              	ksys_write(fd, eint_buf, strlen(eint_buf));
 		eint_count = 0;
 		goto END;
 	}
@@ -1417,7 +1417,7 @@ static ssize_t synaptics_rmi4_baseline_show_s1302(struct device *dev, char *buf,
 			baseline_data = (tmp_h<<8)|tmp_l;
 			if (fd >= 0){
                 		sprintf(data_buf, "%d,", baseline_data);
-                		sys_write(fd, data_buf, strlen(data_buf));
+                		ksys_write(fd, data_buf, strlen(data_buf));
             		}
 			if((x ==0) && ((y == 3) || (y ==4)))
 			{
@@ -1437,7 +1437,7 @@ static ssize_t synaptics_rmi4_baseline_show_s1302(struct device *dev, char *buf,
 			}
 		}
 		if (fd >= 0){
-			sys_write(fd, "\n", 1);
+			ksys_write(fd, "\n", 1);
 		}
 		printk("\n");
 	}
@@ -1532,7 +1532,7 @@ static ssize_t synaptics_rmi4_baseline_show_s1302(struct device *dev, char *buf,
 	
 END:
 	if (fd >= 0) {
-		sys_close(fd);
+		ksys_close(fd);
 		set_fs(old_fs);
 	}
 	release_firmware(fw);	

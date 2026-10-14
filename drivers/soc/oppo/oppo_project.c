@@ -1,4 +1,4 @@
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/proc_fs.h> 
@@ -13,8 +13,10 @@ static ProjectInfoCDTType *format = NULL;
 
 unsigned int init_project_version(void)
 {
-	unsigned int len = (sizeof(ProjectInfoCDTType) + 3) & (~0x3);
-
+	/*
+	 * 4.9 用 smem_alloc(SMEM_ID_VENDOR1, len, ...) 自行按 len 分配；
+	 * 4.19 的 qcom_smem_get() 只按 item 号取已存在的条目，不再需要 len。
+	 */
 	format = (ProjectInfoCDTType *)qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR1, NULL);
 	if (format)
 		return format->nProject;

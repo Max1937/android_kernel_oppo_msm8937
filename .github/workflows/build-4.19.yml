@@ -77,12 +77,18 @@ jobs:
           # defconfig  : 主 defconfig（相对 arch/arm64/configs/）
           # fragments  : 追加的 config 片段，空格分隔（用 merge_config.sh 合并）
           # allow_fail : true 表示该目标失败不阻断整体（移植期用于冒烟）
-          #
-          # push 事件没有 inputs，默认只跑 base 冒烟，避免移植未完成时红一片。
+          # push 事件没有 inputs：改从仓库里的 ci/targets 读取要构建的目标，
+          # 这样不碰默认分支也能手动控制跑哪些机型（改一行文件即触发）。
+          # 文件不存在或为空时回退到 base 冒烟。
           WANT="${{ inputs.targets }}"
           if [ -z "${WANT}" ] && [ "${{ github.event_name }}" = "push" ]; then
-            WANT="base"
+            if [ -f ci/targets ]; then
+              # 去掉注释与空行，多行合成逗号分隔
+              WANT="$(grep -vE '^\s*(#|$)' ci/targets | tr '\n' ',' | sed 's/,$//')"
+              echo "从 ci/targets 读到目标: '${WANT}'"
+            fi
           fi
+          [ -n "${WANT}" ] || WANT="base"
           python3 - "${WANT}" <<'PYEOF' > matrix.json
           import json, os, sys, subprocess
 
