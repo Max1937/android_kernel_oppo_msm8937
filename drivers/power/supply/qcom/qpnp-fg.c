@@ -41,6 +41,11 @@
 #include <xiaomi-msm8953/mach.h>
 #endif
 
+/* OPPO 燃油计（bq27541 等外部 gauge）后端接口，见 fg_oppo_register() */
+#ifdef CONFIG_BATTERY_GAUGE_OPPO
+#include <linux/power/oppo_gauge.h>
+#endif
+
 /* Register offsets */
 
 /* Interrupt offsets */
@@ -716,6 +721,10 @@ static char *fg_supplicants[] = {
 	"bcl",
 	"fg_adc"
 };
+
+#ifdef CONFIG_BATTERY_GAUGE_OPPO
+static struct oppo_gauge_driver *oppo_gauge = NULL;
+#endif
 
 #define DEBUG_PRINT_BUFFER_SIZE 64
 static void fill_string(char *str, size_t str_len, u8 *buf, int buf_len)
@@ -2244,6 +2253,11 @@ static int get_prop_capacity(struct fg_chip *chip)
 	int msoc, rc;
 	bool vbatt_low_sts;
 
+#ifdef CONFIG_BATTERY_GAUGE_OPPO
+	if (oppo_gauge && oppo_gauge->capacity)
+		return oppo_gauge->capacity();
+#endif
+
 	if (chip->use_last_soc && chip->last_soc) {
 		if (chip->last_soc == FULL_SOC_RAW)
 			return FULL_CAPACITY;
@@ -2317,6 +2331,26 @@ static int64_t get_batt_id(unsigned int battery_id_uv, u8 bid_info)
 #define DEFAULT_TEMP_DEGC	250
 static int get_sram_prop_now(struct fg_chip *chip, unsigned int type)
 {
+#ifdef CONFIG_BATTERY_GAUGE_OPPO
+	if (oppo_gauge) {
+		int (*oppo_gauge_prop)(void) = NULL;
+
+		switch (type) {
+		case FG_DATA_CURRENT:
+			oppo_gauge_prop = oppo_gauge->current_now;
+			break;
+		case FG_DATA_VOLTAGE:
+			oppo_gauge_prop = oppo_gauge->voltage_now;
+			break;
+		case FG_DATA_BATT_TEMP:
+			oppo_gauge_prop = oppo_gauge->temp;
+			break;
+		}
+
+		if (oppo_gauge_prop)
+			return oppo_gauge_prop();
+	}
+#endif
 	if (fg_debug_mask & FG_POWER_SUPPLY)
 		pr_info("addr 0x%02X, offset %d value %d\n",
 			fg_data[type].address, fg_data[type].offset,
@@ -4637,6 +4671,10 @@ static int fg_power_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
 		val->intval = chip->learning_data.cc_uah;
+#ifdef CONFIG_BATTERY_GAUGE_OPPO
+		if (oppo_gauge && oppo_gauge->charge_now)
+			val->intval = oppo_gauge->charge_now();
+#endif
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_NOW_RAW:
 		val->intval = get_sram_prop_now(chip, FG_DATA_CC_CHARGE);
@@ -8671,6 +8709,32 @@ static void delayed_init_work(struct work_struct *work)
 done:
 	fg_cleanup(chip);
 }
+
+#ifdef CONFIG_BATTERY_GAUGE_OPPO
+int fg_oppo_register(struct oppo_gauge_driver *gauge)
+{
+	if (oppo_gauge) {
+		pr_err("driver already registered!\n");
+		return -EINVAL;
+	}
+
+	oppo_gauge = gauge;
+	return 0;
+}
+EXPORT_SYMBOL(fg_oppo_register);
+
+int fg_oppo_unregister(void)
+{
+	if (!oppo_gauge) {
+		pr_err("driver already unregistered!\n");
+		return -EINVAL;
+	}
+
+	oppo_gauge = NULL;
+	return 0;
+}
+EXPORT_SYMBOL(fg_oppo_unregister);
+#endif
 
 static int fg_probe(struct platform_device *pdev)
 {

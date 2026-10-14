@@ -14,7 +14,8 @@
 
 #include <linux/module.h>
 #include <linux/proc_fs.h>
-#include <soc/qcom/smem.h>
+#include <linux/soc/qcom/smem.h>
+#include <soc/oppo/oppo_smem_ids.h>
 #include <soc/oppo/device_info.h>
 #include <soc/oppo/oppo_project.h>
 #include <linux/slab.h>
@@ -143,7 +144,7 @@ static void dram_type_add(void)
 	struct manufacture_info dram_info;
 	int *p = NULL;
 
-	p = (int *)smem_alloc(SMEM_ID_VENDOR2, 4, 0, 0);
+	p = (int *)qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR2, NULL);
 
 	if (p) {
 		switch (*p) {

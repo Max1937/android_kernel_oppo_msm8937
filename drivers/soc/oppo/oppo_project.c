@@ -3,7 +3,8 @@
 #include <linux/kernel.h>
 #include <linux/proc_fs.h> 
 #include <linux/fs.h>
-#include <soc/qcom/smem.h>
+#include <linux/soc/qcom/smem.h>
+#include <soc/oppo/oppo_smem_ids.h>
 #include <soc/oppo/oppo_project.h>
 #include <linux/io.h>
 
@@ -14,7 +15,7 @@ unsigned int init_project_version(void)
 {
 	unsigned int len = (sizeof(ProjectInfoCDTType) + 3) & (~0x3);
 
-	format = (ProjectInfoCDTType *)smem_alloc(SMEM_ID_VENDOR1, len, 0, 0);
+	format = (ProjectInfoCDTType *)qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_ID_VENDOR1, NULL);
 	if (format)
 		return format->nProject;
 

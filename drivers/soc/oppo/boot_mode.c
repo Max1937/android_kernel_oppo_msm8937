@@ -17,7 +17,6 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
-#include <soc/qcom/smem.h>
 
 #include <soc/oppo/boot_mode.h>
 

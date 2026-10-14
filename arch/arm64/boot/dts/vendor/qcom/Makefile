@@ -608,6 +608,12 @@ dtb-$(CONFIG_ARCH_SDM632) += sdm632-rumi.dtb \
 endif
 endif
 
+# OPPO R9s / R9sk (MSM8953) —— 板级 DTB
+# 放在所有 ifeq 之外：dtb-$(CONFIG_MACH_16017) 本身带条件，位置无关。
+# 这两个 DTB 依赖 oppo-msm8953/ 下的板级 dtsi 覆盖层。
+dtb-$(CONFIG_MACH_16017) += msm8953-mtp_16017.dtb
+dtb-$(CONFIG_MACH_16027) += msm8953-mtp_16027.dtb
+
 always		:= $(dtb-y)
 subdir-y	:= $(dts-dirs)
 clean-files    := *.dtb *.dtbo
