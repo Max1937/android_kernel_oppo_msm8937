@@ -1,0 +1,378 @@
+# ==============================================================================
+# 4.19-test 实验分支 CI — OPPO MSM8937/MSM8953 系列
+# ------------------------------------------------------------------------------
+# 分支定位：把 4.9 的 OPPO 移植内核升级到 4.19。
+#   4.19 基线：https://github.com/imren0x/msm-4.19 @ mi8953/latest
+#              （= LineageOS sdm660 lineage-20 + CIP 4.19.325-cip136 的统一
+#                MSM8953/8937/450 内核，已内置 drivers/kernelsu）
+#   注：基线里已经带有 drivers/kernelsu（KSU_VERSION=32567）与完整 MSM8953
+#       SoC 支持，所以本分支的工作重点是「把 OPPO 机型支持重新移植上来」，
+#       而不是从零引入 root 方案。
+#
+# 本工作流只做两件事：
+#   1. base —— 冒烟构建 4.19 基线本身（vendor/msm8953-perf_defconfig），
+#      验证工具链 / 基线可用，作为 OPPO 移植的对照基准
+#   2. 机型构建 —— 按矩阵编译各 OPPO 机型，AnyKernel3 打包成 zip
+#
+# 说明：Release 默认关闭，实验分支先把「能编出来」跑通。
+# ==============================================================================
+
+name: Build 4.19 Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: '要构建的目标，逗号分隔（留空 = 全部）：base,R9s'
+        required: false
+        type: string
+        default: 'base'
+      publish_release:
+        description: '是否发布到 GitHub Releases'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CLANG_URL: https://github.com/ZyCromerZ/Clang/releases/download/13.0.1-20230207-release/Clang-13.0.1-20230207.tar.gz
+  BUILD_DATE: ${{ github.run_id }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: setup —— 生成构建矩阵
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      targets_json: ${{ steps.gen.outputs.targets_json }}
+      target_list: ${{ steps.gen.outputs.target_list }}
+      publish: ${{ steps.gen.outputs.publish }}
+    steps:
+      - name: Generate matrix
+        id: gen
+        run: |
+          set -euo pipefail
+
+          BUILD_DATE="$(date +'%Y%m%d')"
+          echo "BUILD_DATE=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+
+          # ---- 目标矩阵 ----
+          # defconfig  : 主 defconfig（相对 arch/arm64/configs/）
+          # fragments  : 追加的 config 片段，空格分隔（用 merge_config.sh 合并）
+          # allow_fail : true 表示该目标失败不阻断整体（移植期用于冒烟）
+          python3 - "${{ inputs.targets }}" <<'PYEOF' > matrix.json
+          import json, os, sys, subprocess
+
+          targets = [
+            {
+              "target": "base", "label": "4.19 base smoke",
+              "defconfig": "vendor/msm8953-perf_defconfig",
+              "fragments": "",
+              "device_names": "", "soc": "MSM8953", "snapdragon": "Snapdragon 625",
+              "allow_fail": False,
+            },
+            {
+              "target": "R9s", "label": "R9s",
+              "defconfig": "vendor/msm8953-perf_defconfig",
+              "fragments": "vendor/oppo-16017.config",
+              "device_names": "r9s|R9s|16017|16027|msm8953",
+              "soc": "MSM8953", "snapdragon": "Snapdragon 625",
+              "allow_fail": True,
+            },
+          ]
+
+          want = [s.strip() for s in (sys.argv[1] if len(sys.argv) > 1 else "").split(",") if s.strip()]
+          if want:
+              targets = [t for t in targets if t["target"] in want]
+
+          print(json.dumps({"include": targets}))
+          PYEOF
+
+          MATRIX="$(cat matrix.json)"
+          INCLUDED="$(python3 -c 'import json;print(json.dumps(json.load(open("matrix.json"))["include"]))')"
+          LIST="$(python3 -c 'import json;print(" ".join(x["target"] for x in json.load(open("matrix.json"))["include"]))')"
+
+          echo "::group::Build matrix"
+          echo "${MATRIX}"
+          echo "::endgroup::"
+          echo "matrix=${MATRIX}"           >> "$GITHUB_OUTPUT"
+          echo "targets_json=${INCLUDED}"   >> "$GITHUB_OUTPUT"
+          echo "target_list=${LIST}"        >> "$GITHUB_OUTPUT"
+          echo "publish=${{ inputs.publish_release && 'true' || 'false' }}" >> "$GITHUB_OUTPUT"
+
+          echo "targets=${LIST}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: build —— 按矩阵编译 + AK3 打包
+  # ---------------------------------------------------------------------------
+  build-kernel:
+    name: "${{ matrix.label }}"
+    needs: setup
+    runs-on: ubuntu-22.04
+    continue-on-error: ${{ matrix.allow_fail }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      DEFCONFIG: ${{ matrix.defconfig }}
+      FRAGMENTS: ${{ matrix.fragments }}
+      DEVICE_NAMES: ${{ matrix.device_names }}
+      SOC: ${{ matrix.soc }}
+      SNAPDRAGON: ${{ matrix.snapdragon }}
+      BUILD_DATE: ${{ needs.setup.outputs.build_date }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: '1'
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - name: 设置 10G swap（内核编译内存保障）
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          path: kernel
+
+      - name: 安装编译依赖
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/apt/sources.list.d/*.list
+          APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30"
+          PKGS="build-essential bc bison flex \
+            libssl-dev libncurses-dev libfl-dev libelf-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            cpio lz4 lzop zstd zip unzip \
+            device-tree-compiler ccache python3 \
+            pngcrush schedtool liblz4-tool libxml2-utils xsltproc squashfs-tools"
+          if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${APT_OPTS} ${PKGS}; then
+            echo "✅ 依赖已安装（跳过 apt-get update）"
+          else
+            echo "⚠️ 直接安装失败，更新索引后重试"
+            for i in 1 2 3; do
+              sudo apt-get update ${APT_OPTS} && break
+              echo "⚠️ apt-get update 第 ${i} 次失败"; sleep 5
+            done
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${APT_OPTS} ${PKGS}
+          fi
+
+      - name: 缓存 Clang 13 工具链
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/toolchain
+          key: clang-13.0.1-20230207-${{ runner.os }}-${{ runner.arch }}
+
+      - name: 下载 Clang 13 工具链
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          wget -q "${CLANG_URL}" -O clang.tar.gz
+          mkdir -p "${GITHUB_WORKSPACE}/toolchain"
+          tar xzf clang.tar.gz -C "${GITHUB_WORKSPACE}/toolchain"
+
+      - name: 校验 Clang 工具链
+        run: |
+          set -euo pipefail
+          "${GITHUB_WORKSPACE}/toolchain/bin/clang" --version | head -n 1
+
+      - name: CCache 缓存
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel419-${{ matrix.target }}
+          restore-keys: |
+            kernel419-${{ matrix.target }}-
+            kernel419-
+          max-size: 2G
+
+      - name: 编译内核（${{ matrix.defconfig }}）
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:/usr/lib/ccache:${PATH}"
+          export KBUILD_BUILD_USER="XuexGao"
+          export KBUILD_BUILD_HOST="localhost"
+          export KBUILD_BUILD_TIMESTAMP="$(date -u +'%a %d %b %Y %H:%M:%S UTC')"
+
+          MAKEFLAGS=(
+            O=out
+            ARCH=arm64
+            LOCALVERSION=
+            CC="ccache clang"
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          )
+
+          echo "::group::Make defconfig"
+          make "${MAKEFLAGS[@]}" "${DEFCONFIG}"
+          echo "::endgroup::"
+
+          # ---- 追加 config 片段（OPPO 机型差异）----
+          if [ -n "${FRAGMENTS}" ]; then
+            for frag in ${FRAGMENTS}; do
+              if [ ! -f "arch/arm64/configs/${frag}" ]; then
+                echo "::error::config 片段不存在: arch/arm64/configs/${frag}"
+                exit 1
+              fi
+              echo "::group::Merge fragment ${frag}"
+              ./scripts/kconfig/merge_config.sh -m out/.config "arch/arm64/configs/${frag}"
+              make "${MAKEFLAGS[@]}" olddefconfig
+              echo "::endgroup::"
+            done
+          fi
+
+          echo "::group::Make Image.gz-dtb"
+          make "${MAKEFLAGS[@]}" -j"$(nproc --all)" Image.gz-dtb 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          echo "::endgroup::"
+
+          echo "::group::CCache 统计"
+          ccache -s || true
+          echo "::endgroup::"
+
+          test -f out/arch/arm64/boot/Image.gz-dtb || { echo "::error::未找到 Image.gz-dtb"; exit 1; }
+          ls -lh out/arch/arm64/boot/
+
+      - name: 记录构建元信息
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          KV="$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | awk '{print $3}' | paste -sd.)"
+          KV_FULL="${KV}$(grep -E '^EXTRAVERSION' Makefile | awk '{print $3}')"
+          RELEASE="$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)"
+          echo "内核版本: ${KV_FULL} (release=${RELEASE})"
+          {
+            echo "KV_FULL=${KV_FULL}"
+            echo "KERNEL_RELEASE=${RELEASE}"
+            echo "TARGET=${TARGET}"
+          } > "${GITHUB_WORKSPACE}/${TARGET}-meta.env"
+
+      - name: 打包 AnyKernel3 刷机包
+        if: matrix.device_names != ''
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          ZIP_NAME="v419_${TARGET}_${BUILD_DATE}.zip"
+
+          rm -f AnyKernel3/boot.img AnyKernel3/*.zip
+          cp -v out/arch/arm64/boot/Image.gz-dtb AnyKernel3/Image.gz-dtb
+
+          KV_FULL="$(cat out/include/config/kernel.release)"
+          KERNEL_STRING="${KV_FULL} (XuexGao@localhost)"
+          NL=$'\n'
+          DEVICE_LINES=""
+          i=1
+          for n in $(echo "${DEVICE_NAMES}" | tr '|' ' '); do
+            DEVICE_LINES="${DEVICE_LINES}${NL}device.name${i}=${n}"
+            i=$((i + 1))
+          done
+          DO_MODULES=$([ -n "$(ls -A AnyKernel3/modules/system/lib/modules/ 2>/dev/null | grep -v '^placeholder$' || true)" ] && echo 1 || echo 0)
+
+          cat > AnyKernel3/anykernel.sh <<EOF
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### AnyKernel setup
+          # global properties
+          properties() { '
+          kernel.string=${KERNEL_STRING}
+          do.devicecheck=1
+          do.modules=${DO_MODULES}
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0${DEVICE_LINES}
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          ### AnyKernel install
+          ## boot files attributes
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 \$RAMDISK/*;
+          set_perm_recursive 0 0 750 750 \$RAMDISK/init* \$RAMDISK/sbin;
+          } # end attributes
+
+          # boot shell variables
+          BLOCK=auto;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          NO_MAGISK_CHECK=1;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install
+          split_boot;
+
+          flash_boot;
+          ## end boot install
+          EOF
+
+          cd AnyKernel3
+          ZIP_PATH="${GITHUB_WORKSPACE}/${ZIP_NAME}"
+          zip -r9 "${ZIP_PATH}" . -x '*.git*' '*.zip'
+          echo "✅ 打包完成: ${ZIP_PATH}"
+          ls -lh "${ZIP_PATH}"
+
+      - name: 上传构建产物（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.target }}
+          path: |
+            ${{ env.TARGET }}-meta.env
+            v419_*.zip
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 失败时上传构建日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog-${{ matrix.target }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 3: release —— 可选，汇总各机型产物
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [setup, build-kernel]
+    if: needs.setup.outputs.publish == 'true' && !cancelled()
+    runs-on: ubuntu-latest
+    env:
+      BUILD_DATE: ${{ needs.setup.outputs.build_date }}
+    steps:
+      - name: 下载各目标产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 列出产物
+        run: find dist -type f | sort
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v419_${{ env.BUILD_DATE }}
+          name: "4.19-test OPPO Kernel ${{ env.BUILD_DATE }}"
+          body: |
+            > ⚠️ **实验分支（4.19-test）**：4.9 → 4.19 移植过程中的构建产物，可能无法开机，仅供测试。
+          files: dist/**/v419_*.zip
+          fail_on_unmatched_files: false
+          draft: true
