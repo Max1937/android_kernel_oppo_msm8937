@@ -393,6 +393,10 @@ config SND_SOC_AK4458
 	depends on I2C
 	select REGMAP_I2C
 
+config SND_SOC_AK4376
+	tristate "AKM AK4376 CODEC"
+	depends on I2C
+
 config SND_SOC_AK4535
 	tristate
 
@@ -1311,5 +1315,11 @@ config SND_SOC_NAU8825
 config SND_SOC_TPA6130A2
 	tristate "Texas Instruments TPA6130A2 headphone amplifier"
 	depends on I2C
+
+config SND_SOC_TFA98XX
+	tristate "NXP Semiconductors TFA98XX amplifier"
+	depends on I2C
+	help
+	  Enables support for NXP98xx Smart PA.
 
 endmenu
