@@ -52,6 +52,10 @@ static int mi2s_rx_sample_rate = SAMPLING_RATE_48KHZ;
 
 static atomic_t quat_mi2s_clk_ref;
 static atomic_t quin_mi2s_clk_ref;
+#ifdef CONFIG_SND_SOC_AK4376
+static atomic_t quin_mi2s_mclk_ref;
+static struct mutex quin_mclk_lock;
+#endif
 static atomic_t auxpcm_mi2s_clk_ref;
 static struct snd_info_entry *codec_root;
 
@@ -1524,6 +1528,50 @@ static void msm_quat_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	}
 }
 
+#ifdef CONFIG_SND_SOC_AK4376
+static int msm8952_enable_ak4376_mclk(struct snd_soc_card *card, bool enable)
+{
+	int ret = 0;
+
+	pr_debug("%s: enable %d mclk ref counter %d\n",
+		 __func__, enable,
+		 atomic_read(&quin_mi2s_mclk_ref));
+
+	mutex_lock(&quin_mclk_lock);
+	if (enable) {
+		if (!atomic_read(&quin_mi2s_mclk_ref)) {
+			wsa_ana_clk.enable = enable;
+			ret = afe_set_lpass_clock_v2(
+					AFE_PORT_ID_PRIMARY_MI2S_RX,
+					&wsa_ana_clk);
+			if (ret < 0) {
+				pr_err("%s: failed to enable mclk %d\n",
+					__func__, ret);
+				goto done;
+			}
+		}
+		atomic_inc(&quin_mi2s_mclk_ref);
+	} else {
+		if (!atomic_read(&quin_mi2s_mclk_ref))
+			goto done;
+		if (!atomic_dec_return(&quin_mi2s_mclk_ref)) {
+			wsa_ana_clk.enable = enable;
+			ret = afe_set_lpass_clock_v2(
+					AFE_PORT_ID_PRIMARY_MI2S_RX,
+					&wsa_ana_clk);
+			if (ret < 0) {
+				pr_err("%s: failed to disable mclk %d\n",
+					__func__, ret);
+				goto done;
+			}
+		}
+	}
+done:
+	mutex_unlock(&quin_mclk_lock);
+	return ret;
+}
+#endif
+
 static int msm_quin_mi2s_snd_startup(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
@@ -1553,6 +1601,16 @@ static int msm_quin_mi2s_snd_startup(struct snd_pcm_substream *substream)
 		pr_err("failed to enable sclk\n");
 		return ret;
 	}
+#ifdef CONFIG_SND_SOC_AK4376
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		ret = msm8952_enable_ak4376_mclk(card, true);
+		if (ret < 0) {
+			pr_err("%s: failed to enable mclk for ak4376 %d\n",
+				__func__, ret);
+			return ret;
+		}
+	}
+#endif
 	if (pdata->mi2s_gpio_p[QUIN_MI2S]) {
 		ret =  msm_cdc_pinctrl_select_active_state(
 			pdata->mi2s_gpio_p[QUIN_MI2S]);
@@ -1589,6 +1647,15 @@ static void msm_quin_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 		pr_err("%s:clock disable failed\n", __func__);
 	if (atomic_read(&quin_mi2s_clk_ref) > 0)
 		atomic_dec(&quin_mi2s_clk_ref);
+#ifdef CONFIG_SND_SOC_AK4376
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		ret = msm8952_enable_ak4376_mclk(card, false);
+		if (ret < 0) {
+			pr_err("%s: failed to disable mclk for ak4376 %d\n",
+				__func__, ret);
+		}
+	}
+#endif
 	if (pdata->mi2s_gpio_p[QUIN_MI2S]) {
 		ret =  msm_cdc_pinctrl_select_sleep_state(
 			pdata->mi2s_gpio_p[QUIN_MI2S]);
@@ -1820,6 +1887,25 @@ static struct snd_soc_ops msm8952_quat_mi2s_be_ops = {
 	.hw_params = msm_mi2s_snd_hw_params,
 	.shutdown = msm_quat_mi2s_snd_shutdown,
 };
+
+#ifdef CONFIG_SND_SOC_AK4376
+static int ak4376_audrx_init(struct snd_soc_pcm_runtime *rtd)
+{
+	struct snd_soc_component *codec = rtd->codec_dais[0]->component;
+	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(codec);
+
+	pr_info("%s: Initialize ak4376 codec\n", __func__);
+
+	if (snd_soc_dapm_ignore_suspend(dapm, "AK4376 HPL"))
+		pr_debug("%s: ignore suspend HPL failed\n", __func__);
+	if (snd_soc_dapm_ignore_suspend(dapm, "AK4376 HPR"))
+		pr_debug("%s: ignore suspend HPR failed\n", __func__);
+
+	snd_soc_dapm_sync(dapm);
+
+	return 0;
+}
+#endif
 
 static struct snd_soc_ops msm8952_quin_mi2s_be_ops = {
 	.startup = msm_quin_mi2s_snd_startup,
@@ -2847,8 +2933,14 @@ static struct snd_soc_dai_link msm8952_quin_dai_link[] = {
 		.stream_name = "Quinary MI2S Playback",
 		.cpu_dai_name = "msm-dai-q6-mi2s.4",
 		.platform_name = "msm-pcm-routing",
+#ifdef CONFIG_SND_SOC_AK4376
+		.codec_dai_name = "ak4376-AIF1",
+		.codec_name = "ak4376.8-0010",
+		.init = ak4376_audrx_init,
+#else
 		.codec_dai_name = "snd-soc-dummy-dai",
 		.codec_name = "snd-soc-dummy",
+#endif
 		.no_pcm = 1,
 		.dpcm_playback = 1,
 		.id = MSM_BACKEND_DAI_QUINARY_MI2S_RX,
