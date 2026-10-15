@@ -535,10 +535,25 @@ sdm632-qrd-overlay.dtbo-base := sdm632.dtb \
 
 else
 ifeq ($(CONFIG_MACH_XIAOMI_MSM8953),y)
-dtb-$(CONFIG_MACH_XIAOMI_ROSY) += rosy-titanium.dtb
-dtb-$(CONFIG_MACH_XIAOMI_VINCE) += vince-titanium.dtb
-dtb-$(CONFIG_MACH_XIAOMI_YSL) += ysl-titanium.dtb
-dtb-$(CONFIG_MACH_XIAOMI_MIDO) += mido-titanium.dtb
+# ⚠️ 本仓库面向 OPPO，不打包任何小米 DTB。
+#
+# 原因（实测踩到）：这几个 DTB 会被 cat 进 Image.gz-dtb，ABL 是按
+# msm-id/board-id 自前向后扫描取**第一个**匹配。这几个小米 DTB 恰好排在
+# 前面，其中 ysl-titanium.dtb 的 board-id = <0x08 0x00>（只有两格，
+# 等于 subtype 通配），会先于 OPPO 的 msm8953-mtp_16027.dtb
+# (<0x08 0x00 0x3e9b>) 命中，于是 R9s 拿到的是红米 S2 的设备树 →
+# 内核跑在与硬件不符的 DTS 上，早期就崩，表现为重启进 fastboot。
+#
+# 注意：CONFIG_MACH_XIAOMI_MSM8953 这个**符号本身仍然必须为 y** ——
+# 4.19 基线里 mdss_dsi.c / msm_flash.c / msm8952.c / qpnp-fg.c 等
+# 有未加保护的 xiaomi_msm8953_mach_get() 调用（详见 README-4.19-port.md），
+# 关掉它反而编不过。所以这里保留符号、只去掉 DTB 条目。
+# （对比：能正常开机的 lineage-22.1 R9s defconfig 里小米机型数为 0，
+#   其镜像只含 16017/16027 两个 DTB。）
+dtb-$(CONFIG_MACH_XIAOMI_ROSY) +=
+dtb-$(CONFIG_MACH_XIAOMI_VINCE) +=
+dtb-$(CONFIG_MACH_XIAOMI_YSL) +=
+dtb-$(CONFIG_MACH_XIAOMI_MIDO) +=
 else
 dtb-$(CONFIG_ARCH_MSM8953) += msm8953-cdp.dtb \
 	msm8953-mtp.dtb \
