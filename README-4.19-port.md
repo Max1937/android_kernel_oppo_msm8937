@@ -79,6 +79,21 @@ error: implicit declaration of function 'xiaomi_msm8953_mach_get'
 error: use of undeclared identifier 'XIAOMI_MSM8953_MACH_MIDO'
 ```
 
+**而且不能"顺手把小米机型关掉来瘦身"。** 4.19 基线里有些**使用点没有加
+`CONFIG_MACH_XIAOMI_*` 保护**，但对应变量的**定义**却在这些保护里面，例如：
+
+| 文件 | 声明处（有保护） | 使用处（**无**保护） |
+|---|---|---|
+| `drivers/video/fbdev/msm/mdss_dsi.c` | `vspn_power_state`、`change_par_ctrl` 在 `#if IS_ENABLED(CONFIG_MACH_XIAOMI_VINCE)` 内 | `:541`、`:3717`、`:3964` 直接使用 |
+| `techpack/camera-legacy/sensor/flash/msm_flash.c` | `flashlight_brightness_value` 在 `CONFIG_MACH_XIAOMI_VINCE` 内 | `:795` 直接使用 |
+| `techpack/audio-legacy/asoc/msm8952.c` | `EXT_PA_MODE` | `:418` 直接使用 |
+
+所以 `CONFIG_MACH_XIAOMI_VINCE=y`（以及 `mi8953.config` 里的整套小米机型开关）
+是**编译所必需**的。曾尝试只保留平台符号、关掉具体机型，结果就是上面这 5 个
+`undeclared` 错误。**结论：原样保留 `vendor/mi8953.config` 的全部机型开关。**
+（代价是会多编 4 个用不到的小米 DTB；要清理得逐个给那些使用点补上保护，
+属于独立的重构，不在本次移植范围内。）
+
 本仓库面向 OPPO、不启用任何小米机型，但该符号仍必须为 `y`，
 好让 `qpnp-fg` 走 `mach_get() == UNKNOWN` 的分支。
 
@@ -93,6 +108,32 @@ error: use of undeclared identifier 'XIAOMI_MSM8953_MACH_MIDO'
 | 3 | `smem_alloc()` 在 4.19 已移除，`<soc/qcom/smem.h>` 也已移走，`SMEM_ID_VENDOR1/2` 枚举被裁掉 | 改用 `qcom_smem_get(QCOM_SMEM_HOST_ANY, ...)`；item 号补进 `include/soc/oppo/oppo_smem_ids.h`（用编译器求值确认 VENDOR1=135、VENDOR2=136） |
 | 4 | 4.19 的 `qpnp-fg.c` 缺 OPPO gauge 后端接口，`oppo_bq27541` 会 undefined symbol | 补回 `fg_oppo_register()`/`fg_oppo_unregister()` 及 4 处取值钩子 |
 | 5 | `merge_config.sh` 的 `OUTPUT` 默认是 `.`，在 `O=out` 之外手工调用会把 `.config` 写进**源码树**，触发 `prepare3` 的 `.. is not clean` 检查 | 把 defconfig 与所有片段交给**一次 make 调用**，用内核自带的 `%.config` 规则合并 |
+
+### ⚠️ 写 config 片段时最大的坑：注释也会被当成配置指令
+
+`scripts/kconfig/merge_config.sh` 用这条 sed 抽取配置名：
+
+```sh
+SED_CONFIG_EXP="s/^\(# \)\{0,1\}\(CONFIG_[a-zA-Z0-9_]*\)[= ].*/\2/p"
+```
+
+凡是匹配 `^# CONFIG_XXX=...` 的行都会被当成一条**配置指令**，接着执行
+
+```sh
+sed -i "/$CFG[ =]/d" $TMP_FILE
+```
+
+把它从合并结果里**删掉**。也就是说，一句看起来无害的说明性注释
+
+```
+# CONFIG_MACH_XIAOMI_MSM8953=y，其余具体机型全部关掉
+```
+
+会把 `CONFIG_MACH_XIAOMI_MSM8953` 变成**未设置**（不是被忽略！），
+从而让 `qpnp-fg.c` 编译失败。本项目实际踩过这个坑。
+
+**规则：描述某个符号时，句首不要紧跟 `CONFIG_`。**
+（`arch/arm64/configs/vendor/oppo-16017.config` 顶部有同样的警告。）
 
 ## 已验证 / 未验证
 
