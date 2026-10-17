@@ -885,4 +885,19 @@ config INPUT_SC27XX_VIBRA
 	  To compile this driver as a module, choose M here. The module will
 	  be called sc27xx_vibra.
 
+
+config INPUT_FPC1020
+	tristate "FPC_BTP fingerprint sensor support"
+	depends on SPI_MASTER
+	help
+	  Say Y here to enable the FPC1020 (FPC BTP) fingerprint sensor
+	  platform driver used on OPPO MSM8953 devices. It controls the
+	  sensor's regulators, clocks, reset and IRQ GPIOs and exposes
+	  them through sysfs for the fingerprint HAL. Without it the
+	  fingerprint HAL fails to open the device and the physical
+	  Home button (integrated with the sensor) does not work.
+
+	  To compile this driver as a module, choose M here. The module
+	  will be called fpc1020_tee.
+
 endif
