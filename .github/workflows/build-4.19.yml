@@ -125,7 +125,7 @@ jobs:
               # 默认目标：纯净内核（无 root），用于验证功能修复
               "target": "R9s", "label": "R9s (clean, no root)",
               "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": BASE_FRAGMENTS + " " + OPPO + " " + NOKSY,
+              "fragments": BASE_FRAGMENTS + " " + OPPO + " " + NOKSU,
               "device_names": "r9s|R9s|16017|16027|msm8953",
               "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": True,
