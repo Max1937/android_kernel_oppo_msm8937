@@ -1635,7 +1635,10 @@ static int qpnp_lab_dt_init(struct qpnp_labibb *labibb,
 	if (labibb->pmic_rev_id->pmic_subtype != PMI8998_SUBTYPE) {
 		rc = labibb->ibb_ver_ops->sel_mode(labibb, 0);
 		if (rc < 0)
-			return rc;
+			{
+				pr_err("labibb-dbg: step 1 (rc < 0) failed, rc=%d\n", rc);
+				return rc;
+		}
 	}
 
 	val = 0;
@@ -1659,7 +1662,10 @@ static int qpnp_lab_dt_init(struct qpnp_labibb *labibb,
 	if (!rc) {
 		rc = qpnp_lab_switching_freq_config(labibb, tmp);
 		if (rc < 0)
-			return rc;
+			{
+				pr_err("labibb-dbg: step 2 (rc < 0) failed, rc=%d\n", rc);
+				return rc;
+		}
 	}
 
 	if (of_property_read_bool(of_node,
@@ -1675,7 +1681,10 @@ static int qpnp_lab_dt_init(struct qpnp_labibb *labibb,
 
 		rc = qpnp_lab_current_limit_config(labibb, tmp);
 		if (rc < 0)
-			return rc;
+			{
+				pr_err("labibb-dbg: step 3 (rc < 0) failed, rc=%d\n", rc);
+				return rc;
+		}
 	}
 
 	if (of_property_read_bool(of_node,
@@ -1701,18 +1710,27 @@ static int qpnp_lab_dt_init(struct qpnp_labibb *labibb,
 		}
 		rc = labibb->lab_ver_ops->ps_ctl(labibb, tmp, true);
 		if (rc < 0)
-			return rc;
+			{
+				pr_err("labibb-dbg: step 4 (rc < 0) failed, rc=%d\n", rc);
+				return rc;
+		}
 	} else {
 		rc = labibb->lab_ver_ops->ps_ctl(labibb, tmp, false);
 		if (rc < 0)
-			return rc;
+			{
+				pr_err("labibb-dbg: step 5 (rc < 0) failed, rc=%d\n", rc);
+				return rc;
+		}
 	}
 
 	rc = of_property_read_u32(of_node, "qcom,qpnp-lab-pfet-size", &tmp);
 	if (!rc) {
 		rc = qpnp_lab_rdson_pfet_config(labibb, tmp);
 		if (rc < 0)
-			return rc;
+			{
+				pr_err("labibb-dbg: step 6 (rc < 0) failed, rc=%d\n", rc);
+				return rc;
+		}
 	}
 
 	rc = of_property_read_u32(of_node, "qcom,qpnp-lab-nfet-size",
@@ -1720,7 +1738,10 @@ static int qpnp_lab_dt_init(struct qpnp_labibb *labibb,
 	if (!rc) {
 		rc = qpnp_lab_rdson_nfet_config(labibb, tmp);
 		if (rc < 0)
-			return rc;
+			{
+				pr_err("labibb-dbg: step 7 (rc < 0) failed, rc=%d\n", rc);
+				return rc;
+		}
 	}
 
 	rc = of_property_read_u32(of_node, "qcom,qpnp-lab-init-voltage",
@@ -1738,7 +1759,10 @@ static int qpnp_lab_dt_init(struct qpnp_labibb *labibb,
 		rc = labibb->lab_ver_ops->set_default_voltage(labibb, false);
 
 	if (rc < 0)
-		return rc;
+		{
+			pr_err("labibb-dbg: step 8 (rc < 0) failed, rc=%d\n", rc);
+			return rc;
+	}
 
 	rc = of_property_read_u32(of_node,
 		"qcom,qpnp-lab-ldo-pulldown-enable", (u32 *)&val);
@@ -1754,7 +1778,10 @@ static int qpnp_lab_dt_init(struct qpnp_labibb *labibb,
 
 	rc = qpnp_lab_psrr_parse_dt_config(labibb, of_node);
 	if (rc < 0)
-		return rc;
+		{
+			pr_err("labibb-dbg: step 9 (rc < 0) failed, rc=%d\n", rc);
+			return rc;
+	}
 
 	if (labibb->swire_control) {
 		rc = qpnp_ibb_set_mode(labibb, IBB_HW_CONTROL);
