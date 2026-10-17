@@ -2270,6 +2270,20 @@ struct sdhci_msm_pltfm_data *sdhci_msm_populate_pdata(struct device *dev,
 	if (gpio_is_valid(pdata->status_gpio) && !(flags & OF_GPIO_ACTIVE_LOW))
 		pdata->caps2 |= MMC_CAP2_CD_ACTIVE_HIGH;
 
+	/*
+	 * OPPO R9s: SD 卡槽 vdd 使能脚。设备树里是 "vdd-gpio-en"
+	 * （oppo-msm8953/msm8953-mtp.dtsi: vdd-gpio-en = <&tlmm 96 0x1>）。
+	 * 4.19 基线没有解析这个属性，导致 SD 卡不上电、识别不到卡。
+	 * 解析失败不致命（别的机型没这属性），保持无效值即可。
+	 */
+	pdata->sd_vdd_en = of_get_named_gpio_flags(np, "vdd-gpio-en", 0,
+						   &flags);
+	if (pdata->sd_vdd_en < 0)
+		dev_dbg(dev, "no vdd-gpio-en, assuming always-on slot\n");
+	else
+		dev_info(dev, "sdcard vdd enable gpio = %d\n",
+			 pdata->sd_vdd_en);
+
 	of_property_read_u32(np, "qcom,bus-width", &bus_width);
 	if (bus_width == 8)
 		pdata->mmc_bus_width = MMC_CAP_8_BIT_DATA;
@@ -2891,8 +2905,28 @@ static int sdhci_msm_setup_vreg(struct sdhci_msm_pltfm_data *pdata,
 			bool enable, bool is_init)
 {
 	int ret = 0, i;
+	struct sdhci_msm_pltfm_data *pl = pdata;
 	struct sdhci_msm_slot_reg_data *curr_slot;
 	struct sdhci_msm_reg_data *vreg_table[2];
+	static bool first_pwr_on = true;
+
+	/*
+	 * OPPO R9s: SD 卡槽的 vdd 由外部 GPIO 控制（DT: vdd-gpio-en，本机 gpio 96）。
+	 * 必须在 vreg 之前拉高，断电时放在最后拉低。
+	 *
+	 * 注意这里要放在 `if (!curr_slot) goto out` 之前：OPPO 这块板的
+	 * vreg_data 可能为空（供电完全靠这个 GPIO），若沿用 4.19 原有的
+	 * 提前返回路径，就会连 GPIO 都不拉，卡永远不上电。
+	 */
+	if (gpio_is_valid(pl->sd_vdd_en)) {
+		if (enable) {
+			gpio_direction_output(pl->sd_vdd_en, 1);
+			gpio_set_value(pl->sd_vdd_en, 1);
+			/* 首次上电需要更长的建立时间，之后只需短延时 */
+			mdelay(first_pwr_on ? 20 : 2);
+			first_pwr_on = false;
+		}
+	}
 
 	curr_slot = pdata->vreg_data;
 	if (!curr_slot) {
@@ -2915,6 +2949,12 @@ static int sdhci_msm_setup_vreg(struct sdhci_msm_pltfm_data *pdata,
 		}
 	}
 out:
+	/* 断电时最后再拉低 GPIO，保证 vreg 先下电 */
+	if (!enable && gpio_is_valid(pl->sd_vdd_en)) {
+		gpio_direction_output(pl->sd_vdd_en, 0);
+		gpio_set_value(pl->sd_vdd_en, 0);
+		mdelay(2);
+	}
 	return ret;
 }
 
@@ -5526,11 +5566,53 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 
 	sdhci_msm_bus_voting(host, 1);
 
+	/*
+	 * OPPO R9s: 申请 SD 卡槽 vdd 使能 GPIO（DT: vdd-gpio-en，本机 gpio 96）。
+	 *
+	 * 4.19 基线没有这段，卡槽实际没有上电 —— 控制器能注册、却永远检测
+	 * 不到卡，对应真机上「SD 卡插了也挂载不了」。
+	 * 必须在下面 sdhci_msm_vreg_init()/首次上电之前完成申请，
+	 * 否则上电时 GPIO 还没被本驱动持有。
+	 */
+	if (gpio_is_valid(msm_host->pdata->sd_vdd_en)) {
+		ret = gpio_request(msm_host->pdata->sd_vdd_en,
+				   "sdcard_vdd_enable");
+		if (ret) {
+			dev_err(&pdev->dev,
+				"failed to request sdcard vdd gpio %d: %d\n",
+				msm_host->pdata->sd_vdd_en, ret);
+			/* 非致命：继续走，最坏情况是没卡 */
+			msm_host->pdata->sd_vdd_en = -EINVAL;
+			ret = 0;
+		} else {
+			gpio_direction_output(msm_host->pdata->sd_vdd_en, 0);
+		}
+	}
+
 	/* Setup regulators */
 	ret = sdhci_msm_vreg_init(&pdev->dev, msm_host->pdata, true);
 	if (ret) {
 		dev_err(&pdev->dev, "Regulator setup failed (%d)\n", ret);
 		goto bus_unregister;
+	}
+
+	/*
+	 * OPPO R9s: probe 阶段就把卡槽上电。
+	 *
+	 * 正常情况下 sdhci_msm_setup_vreg() 是由 pwr_irq（CORE_PWRCTL_BUS_ON）
+	 * 触发的，但本机的 vdd 走外部 GPIO，而且 mmc core 在 host 注册后会
+	 * 立刻做一次卡检测；如果等到 pwr_irq 才上电，第一次检测必然读不到卡。
+	 * 这里显式拉一次电，保证 host 注册时卡槽已经有电。
+	 * 对没有 vdd-gpio-en 的机型，这段是空操作（sd_vdd_en 无效）。
+	 */
+	if (gpio_is_valid(msm_host->pdata->sd_vdd_en)) {
+		ret = sdhci_msm_setup_vreg(msm_host->pdata, true, true);
+		if (ret) {
+			dev_warn(&pdev->dev,
+				 "sdcard vdd power-up failed (%d), continue\n",
+				 ret);
+			ret = 0;
+		}
 	}
 
 	/* Reset the core and Enable SDHC mode */
@@ -5923,6 +6005,10 @@ static int sdhci_msm_remove(struct platform_device *pdev)
 	pr_debug("%s: %s Enter\n", dev_name(&pdev->dev), __func__);
 	if (!gpio_is_valid(msm_host->pdata->status_gpio))
 		device_remove_file(&pdev->dev, &msm_host->polling);
+
+	/* 释放 probe 里申请的 SD 卡槽 vdd 使能 GPIO（OPPO R9s） */
+	if (gpio_is_valid(msm_host->pdata->sd_vdd_en))
+		gpio_free(msm_host->pdata->sd_vdd_en);
 
 	device_remove_file(&pdev->dev, &msm_host->auto_cmd21_attr);
 	device_remove_file(&pdev->dev, &msm_host->msm_bus_vote.max_bus_bw);

@@ -213,6 +213,13 @@ struct sdhci_msm_pltfm_data {
 	unsigned char sup_ice_clk_cnt;
 	u32 ice_clk_max;
 	u32 ice_clk_min;
+	/*
+	 * OPPO R9s(MSM8953) 的 SD 卡槽 vdd 供给由一颗外部 GPIO 控制
+	 * （设备树属性 vdd-gpio-en，本机是 tlmm gpio 96）。
+	 * 4.9 分支已经有这套支持，4.19 基线没有 —— 缺了它，SD 卡控制器能
+	 * 起来但卡始终上电失败，表现为「插了卡也识别不到 / 挂载不了」。
+	 */
+	int sd_vdd_en;
 };
 
 struct sdhci_msm_bus_vote {
