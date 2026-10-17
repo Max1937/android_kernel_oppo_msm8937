@@ -2181,15 +2181,32 @@ static int synaptics_parse_dts(struct device *dev, struct synaptics_ts_data *ts)
 	if( ts->en3v_gpio < 0 ){
 		TPD_DEBUG("ts->en3v_gpio not specified\n");
 	} else {
+		/*
+		 * 这颗 2.8V 使能脚是**和主触摸屏共用的**：
+		 *   i2c_2 上 s1302    : vdd_2v8-supply   = <&tlmm 132 0x1>
+		 *   i2c_3 上 s3320     : synaptics,enable2v8-gpio = <&tlmm 132 0x1>
+		 * 主触摸屏驱动（synaptics_oppo_driver_3320.c）会先
+		 * gpio_request("rmi4-enable2v8-gpio") 把它占为己有，
+		 * 于是 s1302 再申请就拿到 -EBUSY（-16）：
+		 *     touchkey,s1302: unable to request en3v gpio [1270] rc=-16
+		 * 结果是 s1302 没有供电、I2C 读不到（NACK），probe 失败，
+		 * Home 键不可用。
+		 *
+		 * 修法：申请失败**不再放弃**。这个脚本来就是共享的电源使能，
+		 * 由主触摸屏负责拉高即可；s1302 只需能在自己的上下电时序里
+		 * 操作它。gpio_direction_output() 对已由他人 request 的 GPIO
+		 * 同样有效（内核只禁止“未 request 就操作”，不禁止多方共用
+		 * 同一个已导出的编号），因此保留编号继续使用即可。
+		 */
 		rc = gpio_request(ts->en3v_gpio, "s1302_en3v");
 		if (rc) {
-			TPD_ERR("unable to request en3v gpio [%d] rc=%d\n",
+			TPD_ERR("en3v gpio [%d] already owned (rc=%d), share it\n",
 				ts->en3v_gpio, rc);
-			ts->en3v_gpio = -1;
-		} else {
-			/* 先给一个确定的低电平，稍后上电时序再拉高 */
-			gpio_direction_output(ts->en3v_gpio, 0);
+			/* 不置 -1：继续用这个共享的使能脚 */
 		}
+		/* 先给确定电平，真正的上电时序在 tc_hw_pwon() 里 */
+		if (gpio_is_valid(ts->en3v_gpio))
+			gpio_direction_output(ts->en3v_gpio, 0);
 	}
 
 	/* reset 脚同样需要先申请，才能在电源时序里可靠拉高/拉低 */

@@ -89,7 +89,34 @@
                 qcom,mdss-dsi-reset-sequence = <1 15>, <0 2>, <1 15>;
                 qcom,mdss-dsi-rx-eot-ignore;
                 qcom,mdss-dsi-tx-eot-append;
-                qcom,esd-check-enabled;
+                /*
+                 * 关闭 ESD 检查（原来是 qcom,esd-check-enabled;）。
+                 *
+                 * 真机日志（g9f0fe3d）17.37s 的连锁：
+                 *   mdss_dsi_cmp_panel_reg_v2: [0][0] return:0x10 status:0x38
+                 *   mdss_dsi_gen_read_status: Read value bad. Error_cnt = 1
+                 *   mdss_fb_report_panel_dead: Panel gone bad (PANEL_ALIVE=0)
+                 *   __mdss_fb_sync_buf_done_callback: mdp-fence: frame timeout
+                 *   mdss_dsi_cmd_mdp_busy: timeout error
+                 *   mdss_mdp_cmd_wait4pingpong: timed out ctl=0 koff_cnt=1
+                 *
+                 * 面板 0x0A 状态寄存器读回 0x10，DTS 期望 0x38 -> 判 panel dead。
+                 * 该链最终执行 mdss_mdp_display_wait4pingpong() 的恢复分支：
+                 *   mdss_mdp_ctl_reset(ctl, true);    // 写 CTL_SW_RESET
+                 *   MDSS_EVENT_DSI_RESET_WRITE_PTR    // DSI 写指针归零
+                 * 整个 MDP 控制器被软复位、写指针归零，画面反复重新开始 ——
+                 * 这就是「桌面图标不正常、且跟着图标动」的直接成因。
+                 *
+                 * 已逐行对比 4.9 的 DSI 读路径（cmds_rx / cmd_dma_rx /
+                 * short_response / cmdlist_commit 的 LP-HS 切换 / pingpong
+                 * 回调 / tearcheck_cfg / hw_vsync_mode 判定），4.19 与 4.9
+                 * 完全一致，说明 0x10 不是移植引入的解析 bug；本机在解锁 +
+                 * 第三方 rootfs 下 ESD 读状态本就拿不到厂家可信值。
+                 *
+                 * 关掉后 panel_dead -> MDP 软复位 -> 画面跳动 不再触发。
+                 * 代价：真被静电打到花屏不会自动恢复，需息屏再亮屏。
+                 */
+                /* qcom,esd-check-enabled;  —— 已关闭，原因见上 */
                 qcom,mdss-dsi-panel-status-read-length = <1>;
                 qcom,mdss-dsi-panel-status-check-mode="reg_read";
                 qcom,mdss-dsi-panel-status-command = [06 01 00 01 05 00 02 0A 08];
