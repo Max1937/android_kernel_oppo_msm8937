@@ -2158,9 +2158,50 @@ static int synaptics_parse_dts(struct device *dev, struct synaptics_ts_data *ts)
 	if( ts->reset_gpio < 0 ){
 		TPD_DEBUG("ts->reset-gpio  not specified\n");
 	}
+
+	/*
+	 * vdd_2v8 这一路电源由 TLMM 的一根 GPIO 使能（DTS 里写作
+	 *     vdd_2v8-supply = <&tlmm 132 0x1>;
+	 * 所以这里用 of_get_named_gpio() 把它当 GPIO 解析。
+	 *
+	 * 注意 4.19 的 of_get_named_gpio() 返回的是**全局 GPIO 号**
+	 * （desc_to_gpio()），例如 1234，而不是 132 这种相对号。
+	 * 关键是要先 gpio_request() 再操作 —— 原代码直接
+	 * gpio_direction_output()，因为没申请过这个号，内核会拒绝并
+	 * 静默返回错误，使能脚实际没被拉高，s1302 因此没有供电，
+	 * I2C 读不到芯片：
+	 *     i2c-msm-v2 78b6000.i2c: NACK: slave not responding,
+	 *         ensure its powered: ... slv_addr:0x20
+	 *     touchkey,s1302: synaptics_read_product_id: failed for page select
+	 *     touchkey,s1302: synaptics is no exist!
+	 *     touchkey,s1302: probe error: not normal end ret =-1
+	 * 结果就是 Home 键（R9s 是触摸式按键，走 s1302）不可用。
+	 */
 	ts->en3v_gpio = of_get_named_gpio(np, "vdd_2v8-supply", 0);
 	if( ts->en3v_gpio < 0 ){
 		TPD_DEBUG("ts->en3v_gpio not specified\n");
+	} else {
+		rc = gpio_request(ts->en3v_gpio, "s1302_en3v");
+		if (rc) {
+			TPD_ERR("unable to request en3v gpio [%d] rc=%d\n",
+				ts->en3v_gpio, rc);
+			ts->en3v_gpio = -1;
+		} else {
+			/* 先给一个确定的低电平，稍后上电时序再拉高 */
+			gpio_direction_output(ts->en3v_gpio, 0);
+		}
+	}
+
+	/* reset 脚同样需要先申请，才能在电源时序里可靠拉高/拉低 */
+	if (ts->reset_gpio > 0) {
+		rc = gpio_request(ts->reset_gpio, "s1302_reset");
+		if (rc) {
+			TPD_ERR("unable to request reset gpio [%d] rc=%d\n",
+				ts->reset_gpio, rc);
+			ts->reset_gpio = -1;
+		} else {
+			gpio_direction_output(ts->reset_gpio, 1);
+		}
 	}
 
 	/***********power regulator_get****************/
