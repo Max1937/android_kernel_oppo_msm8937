@@ -1485,7 +1485,29 @@ static int qpnp_lab_psrr_parse_dt_config(struct qpnp_labibb *labibb,
 
 	rc = of_property_read_u32(of_node,
 		"qcom,qpnp-lab-high-psrr-src-select", &tmp);
-	if (!rc) {
+	/*
+	 * 这两个 PSRR 属性都是**可选**的（bindings 原文：
+	 * "qcom,qpnp-lab-vref-high-psrr-select: required if the
+	 *  qcom,qpnp-lab-high-psrr-src-select is present"）。
+	 * 本机（R9s / pmi8950）的 DTS 两个都没有 —— 4.9 分支也没有。
+	 *
+	 * 原代码的问题：属性不存在时 of_property_read_u32() 返回 -EINVAL，
+	 * 这里靠 if (!rc) 跳过主体逻辑是对的，但函数末尾直接 `return rc;`
+	 * 就把这个「可选属性缺失」的 -EINVAL 当成失败返回了，链路是：
+	 *     qpnp_lab_dt_init -> qpnp_lab_psrr_parse_dt_config -> -22
+	 *     register_qpnp_lab_regulator: wrong DT parameter specified: rc = -22
+	 *     qcom,qpnp-labibb-regulator: probe failed with error -22
+	 * 真机日志里用打点确认过，正是 step 9（也就是这一次调用）失败。
+	 *
+	 * LAB/IBB 是 pmi8950 上给显示面板供 AVDD/VNEG 的升压稳压器，
+	 * 它 probe 失败 => 面板供电不完整 => 桌面图标显示发花。
+	 *
+	 * 修法：属性缺失属正常情况，把 rc 清 0 后继续，不要让 -EINVAL
+	 * 逃到函数结尾。
+	 */
+	if (rc == -EINVAL) {
+		rc = 0;		/* 可选属性不存在，正常 */
+	} else if (!rc) {
 		val = tmp;
 
 		rc = of_property_read_u32(of_node,

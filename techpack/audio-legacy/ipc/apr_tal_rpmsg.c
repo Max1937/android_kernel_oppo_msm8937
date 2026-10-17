@@ -144,6 +144,24 @@ struct apr_svc_ch_dev *apr_tal_open(uint32_t clnt, uint32_t dest, uint32_t dl,
 			rc = -ETIMEDOUT;
 			goto unlock;
 		}
+		/*
+		 * 重要：wait_event_timeout() 在**条件满足**时返回的是
+		 * "剩余 jiffies 数"（正数），只有**超时**才返回 0。
+		 *
+		 * 而函数末尾是 `return rc ? NULL : apr_ch;` —— 若不在这里把
+		 * rc 清 0，就把"成功等到通道"误判成失败，永远返回 NULL。
+		 *
+		 * 真机日志证实了这条因果链（ADSP 已起来、rpmsg 通道已 Up）：
+		 *     apr_tal_rpmsg_probe: Channel[apr_audio_svc] state[Up]
+		 *     APR: Unable to open handle
+		 *     ocm_core_open: Unable to register CORE
+		 *     pmic_analog_codec ...: Adsp is not loaded yet 2
+		 *     ASoC: CODEC DAI msm_dig_cdc_dai_vifeed not registered
+		 *     snd_soc_register_card failed (-517)
+		 * 结果就是 q6core 永远打不开 → 音频 codec 一直 EPROBE_DEFER
+		 * → **没有声音**。
+		 */
+		rc = 0;
 	}
 
 	pr_debug("%s: Channel connected, returning handle :%pK\n",
