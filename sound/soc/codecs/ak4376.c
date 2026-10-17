@@ -1484,26 +1484,20 @@ static int ak4376_parse_dt(struct ak4376_priv *ak4376)
 	}
 
 	/*
-	 * 必须先 gpio_request 再操作。
-	 *
-	 * 4.19 的 of_get_named_gpio() 返回的是**全局 GPIO 编号**
-	 * （desc_to_gpio()），而不是 DTS 里写的那个相对号。未经申请
-	 * 的编号，内核会拒绝 gpio_direction_output() 并静默返回错误。
-	 *
-	 * 原代码把这个号直接交给 ak4376_pdn_control() 里的
-	 * gpio_direction_output()，等于从未真正拉高 PDN 脚 ——
-	 * AK4376（DAC/codec，R9s 上真正出声的芯片）一直没被使能，
-	 * 这就是「sound card 注册成功、但完全没有声音」的原因。
-	 * （与 s1302 触摸按键是同一类问题：未经 gpio_request 就操作。）
+	 * 注意：这里**不要**再 gpio_request()。
+	 * ak4376_probe() 里本来就已经对同一个 priv_pdn_en 做了
+	 *     gpio_request(ak4376->priv_pdn_en, "ak4376 pdn");
+	 * （见本文件 ak4376_probe 中），由它负责申请、拉低、
+	 * 以及出错时 gpio_free()。
+	 * 之前在这里又申请一次，第二次必然拿到 -EBUSY(-16)，
+	 * 而 ak4376_probe() 末尾是 `return ret;`，于是整个 component
+	 * probe 就以 -16 失败：
+	 *     i2c-msm-v2 7af8000.i2c: NACK ... slv_addr:0x10
+	 *     ak4376 8-0010: ASoC: failed to probe component -16
+	 *     msm8952-asoc-wcd: ASoC: failed to instantiate card -16
+	 *     snd_soc_register_card failed (-16)
+	 * 结果就是完全没有声音。这里只解析 DT，申请交给 probe。
 	 */
-	if (gpio_request(ak4376->priv_pdn_en, "ak4376_pdn")) {
-		printk(KERN_ERR "ak4376: unable to request pdn gpio %d\n",
-		       ak4376->priv_pdn_en);
-		ak4376->priv_pdn_en = -1;
-	} else {
-		/* 先给确定电平，真正的上电时序在 ak4376_pdn_control() 里 */
-		gpio_direction_output(ak4376->priv_pdn_en, 0);
-	}
 
 	ak4376->enable_gpiod = devm_gpiod_get_optional(&ak4376->i2c->dev, "enable", GPIOD_OUT_HIGH);
 	if (IS_ERR(ak4376->enable_gpiod))
