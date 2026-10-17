@@ -210,7 +210,31 @@
 #include "msm8953-gpu.dtsi"
 #include "msm8953-mdss.dtsi"
 #include "msm8953-mdss-pll.dtsi"
-#include "msm8953-smp2p.dtsi"
+/*
+ * 这里**不能**再 include "msm8953-smp2p.dtsi"。
+ *
+ * 4.19 基线同时存在两套 qcom,smp2p 节点：
+ *   1) msm8953-smp2p.dtsi 里的 qcom,smp2p-{modem,wcnss,adsp}@0x0b011008
+ *      —— 只有 reg/remote-pid/irq-bitmask，**缺** qcom,smem、
+ *         qcom,ipc、qcom,local-pid；
+ *   2) 本文件下方内联的 smp2p-{modem,adsp,wcnss}
+ *      —— 属性完整（qcom,smem/qcom,ipc/qcom,local-pid 齐全）。
+ *
+ * 两者 compatible 相同（"qcom,smp2p"），都会被 probe。驱动
+ * drivers/soc/qcom/smp2p.c 的 qcom_smp2p_probe() 一上来就
+ * of_property_read_u32_array("qcom,smem")，缺失即返回 -EINVAL，
+ * 于是 1) 那套必然失败：
+ *     qcom_smp2p: probe of b011008.qcom,smp2p-modem failed with error -22
+ *     qcom_smp2p: probe of b011008.qcom,smp2p-wcnss failed with error -22
+ *     qcom_smp2p: probe of b011008.qcom,smp2p-adsp  failed with error -22
+ * 这些正是真机 ramoops 里看到的报错。smp2p 是 AP 与
+ * modem/adsp/wcnss 之间的双向通知通道，失败会连带基带、ADSP
+ * （进而音频）全部不可用。
+ *
+ * 4.9 分支只有 1) 那套、没有内联节点，所以那边不报错；
+ * 4.19 以 2) 为准，1) 属于遗留文件，且其内部标签无任何外部 &引用
+ * （已逐个核对），故去掉这个 include。
+ */
 
 &soc {
 	#address-cells = <1>;

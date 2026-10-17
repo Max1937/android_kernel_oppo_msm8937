@@ -109,6 +109,10 @@ jobs:
           # 本仓库面向 OPPO，不启用任何 Xiaomi 机型，但该符号仍必须为 y，
           # 让 qpnp-fg 走 xiaomi_msm8953_mach_get() 返回 UNKNOWN 的分支。
           BASE_FRAGMENTS = "vendor/mi8953.config"
+          OPPO = "vendor/oppo-16017.config"
+          # 纯净版：显式关掉 KernelSU（config KSU 是 default y，
+          # 不关的话编出来一定自带 BakaSU）。
+          NOKSU = "vendor/oppo-no-ksu.config"
           targets = [
             {
               "target": "base", "label": "4.19 base smoke",
@@ -118,9 +122,19 @@ jobs:
               "allow_fail": False,
             },
             {
-              "target": "R9s", "label": "R9s",
+              # 默认目标：纯净内核（无 root），用于验证功能修复
+              "target": "R9s", "label": "R9s (clean, no root)",
               "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": BASE_FRAGMENTS + " vendor/oppo-16017.config",
+              "fragments": BASE_FRAGMENTS + " " + OPPO + " " + NOKSY,
+              "device_names": "r9s|R9s|16017|16027|msm8953",
+              "soc": "MSM8953", "snapdragon": "Snapdragon 625",
+              "allow_fail": True,
+            },
+            {
+              # 保留一份带 KernelSU 的产物，便于对照/将来合入
+              "target": "R9s-ksu", "label": "R9s (with KernelSU)",
+              "defconfig": "vendor/msm8953-perf_defconfig",
+              "fragments": BASE_FRAGMENTS + " " + OPPO,
               "device_names": "r9s|R9s|16017|16027|msm8953",
               "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": True,
