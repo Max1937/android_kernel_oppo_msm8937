@@ -1699,6 +1699,20 @@ static int __init msm_pil_init(void)
 		return -EPROBE_DEFER;
 	}
 
+	/*
+	 * qcom_smem_get() 对"item 号越界"返回的是 ERR_PTR(-EINVAL)，
+	 * 而不是 NULL。原代码只处理了 -EPROBE_DEFER，于是 g_md_toc 会带着
+	 * 错误指针进入下面 minidump 相关路径（g_md_toc->md_toc_init 等），
+	 * 属于未定义行为。
+	 * 这里显式归零：minidump 只是调试辅助，取不到就当作"本机没有
+	 * minidump TOC"，不应影响 PIL 固件加载主流程。
+	 */
+	if (IS_ERR(g_md_toc)) {
+		pr_debug("Minidump: no global TOC (id=%d, err=%ld), skipping\n",
+			 SBL_MINIDUMP_SMEM_ID, PTR_ERR(g_md_toc));
+		g_md_toc = NULL;
+	}
+
 	pil_wq = alloc_workqueue("pil_workqueue", WQ_HIGHPRI | WQ_UNBOUND, 0);
 	if (!pil_wq)
 		pr_warn("pil: Defaulting to sequential firmware loading.\n");

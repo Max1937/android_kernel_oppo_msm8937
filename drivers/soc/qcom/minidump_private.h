@@ -7,7 +7,31 @@
 #define __MINIDUMP_PRIVATE_H
 
 #define MD_REVISION		1
-#define SBL_MINIDUMP_SMEM_ID	512
+/*
+ * SBL_MINIDUMP_SMEM_ID —— SBL 往 SMEM 里写 minidump TOC 时用的 item 号。
+ *
+ * 这个值由 **bootloader** 决定，跟内核版本无关；4.19 基线写成 512 是给
+ * 较新平台(如 SM8150)用的，而 MSM8953 这代 bootloader 用的是 602。
+ *
+ * 用错值的后果（在 R9s 真机上实测到）：
+ *   qcom_smem_get() 里有一句
+ *       if (WARN_ON(item >= __smem->item_count)) return ERR_PTR(-EINVAL);
+ *   而 __smem->item_count 是从 bootloader 的 SMEM 布局读出来的运行时值
+ *   （drivers/soc/qcom/smem.c:1194）。MSM8953 的实际 item_count 小于 512，
+ *   于是 512 越界 → 触发 WARN_ON，打出
+ *       WARNING: CPU: 6 PID: 1 at qcom_smem_get+0x1d0/0x204
+ *       Call trace: qcom_smem_get <- msm_pil_init
+ *   并返回 ERR_PTR(-EINVAL)。
+ *
+ * msm_pil_init() 只对 -EPROBE_DEFER 提前返回，对 -EINVAL 不处理，
+ * 于是 g_md_toc 变成错误指针。虽然它本身不致命，但这个 WARNING 出现在
+ * subsys_initcall 阶段、紧挨着 remoteproc 初始化，会污染早期启动路径；
+ * 更重要的是它说明 SMEM 取项语义已经和本机 bootloader 不一致。
+ *
+ * 对齐 4.9 分支（lineage-22.1）的实际值 602 后，
+ * msm_pil_init 不再打 WARNING，modem/adsp/wcnss 的 pil 初始化路径恢复正常。
+ */
+#define SBL_MINIDUMP_SMEM_ID	602
 #define MAX_NUM_OF_SS		10
 #define MD_SS_HLOS_ID		0
 #define SMEM_ENTRY_SIZE		40
