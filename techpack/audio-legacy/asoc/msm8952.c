@@ -565,6 +565,41 @@ static int msm_mi2s_rx_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	return 0;
 }
 
+/*
+ * 扬声器 smart PA（TFA98XX）专用参数修正。
+ *
+ * TFA9890 的 I2S 接口只接受 48kHz、单声道，因此这条后端 DAI 必须把
+ * hw_params 强制成固定值，不能用通用的 msm_mi2s_rx_be_hw_params_fixup
+ * （后者跟随 msm_pri_mi2s_rx_ch / mi2s_rx_sample_rate，可能给出
+ * 44.1kHz 或双声道，导致 PA 无声或啸叫）。
+ *
+ * 这段在 4.9 分支里是有的（techpack/audio/asoc/msm8952.c 中的
+ * msm_mi2s_rx_tfa98xx_be_hw_params_fixup），4.19 基线漏掉了，
+ * 而 QUAT_MI2S_RX 又默认接 dummy codec，所以扬声器完全没有声音。
+ */
+#ifdef CONFIG_SND_SOC_TFA98XX
+#define TFA98XX_CHANNELS	1
+#define TFA98XX_SAMPLE_RATE	48000
+
+static int msm_mi2s_rx_tfa98xx_be_hw_params_fixup(
+		struct snd_soc_pcm_runtime *rtd,
+		struct snd_pcm_hw_params *params)
+{
+	struct snd_interval *rate = hw_param_interval(params,
+					SNDRV_PCM_HW_PARAM_RATE);
+
+	struct snd_interval *channels = hw_param_interval(params,
+					SNDRV_PCM_HW_PARAM_CHANNELS);
+
+	pr_debug("%s: Num of channels = %d Sample rate = %d\n", __func__,
+			TFA98XX_CHANNELS, TFA98XX_SAMPLE_RATE);
+	rate->min = rate->max = TFA98XX_SAMPLE_RATE;
+	channels->min = channels->max = TFA98XX_CHANNELS;
+
+	return 0;
+}
+#endif
+
 static int msm_tx_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 				struct snd_pcm_hw_params *params)
 {
@@ -3008,12 +3043,44 @@ static struct snd_soc_dai_link msm_int_be_dai[] = {
 		.stream_name = "Quaternary MI2S Playback",
 		.cpu_dai_name = "msm-dai-q6-mi2s.3",
 		.platform_name = "msm-pcm-routing",
+		/*
+		 * 扬声器走 TFA98XX（smart PA）。
+		 *
+		 * 4.9 分支这里是直接把 codec 指到 TFA98XX 的：
+		 *     .codec_dai_name = "tfa98xx-aif-8-36";
+		 *     .codec_name     = "tfa98xx.8-0036";
+		 *     .be_hw_params_fixup = msm_mi2s_rx_tfa98xx_be_hw_params_fixup;
+		 * 而 4.19 基线这里留的是 snd-soc-dummy，TFA98XX 只在设备树
+		 * 有 "ext_pa_tfa98xx" 属性时才作为**额外**的 dai link 追加
+		 * （那是 Xiaomi 机型的写法，本机 DTS 没有该属性）。
+		 *
+		 * 结果是扬声器播放被路由到 dummy codec：
+		 *     audio_hw_primary: start_output_stream:
+		 *         usecase(1: low-latency-playback) devices(0x2)   <- speaker
+		 * 声音进了空设备，完全没有输出。
+		 * 真机日志里也印证了这一点 —— AK4376 的 hw_params 从未被调用
+		 * （它自带 printk("[AKM test] ...") 一次都没出现），因为
+		 * 默认播放走的是 speaker/QUAT 这条路，而不是 quin/AK4376。
+		 *
+		 * 因此按 4.9 的方式把 QUAT_MI2S_RX 直接接到 TFA98XX，
+		 * 并用 TFA98XX 专用 fixup 强制 48kHz / 单声道
+		 * （TFA9890 的 I2S 只接受这个配置）。
+		 */
+#ifdef CONFIG_SND_SOC_TFA98XX
+		.codec_dai_name = "tfa98xx-aif-8-36",
+		.codec_name = "tfa98xx.8-0036",
+#else
 		.codec_dai_name = "snd-soc-dummy-dai",
 		.codec_name = "snd-soc-dummy",
+#endif
 		.no_pcm = 1,
 		.dpcm_playback = 1,
 		.id = MSM_BACKEND_DAI_QUATERNARY_MI2S_RX,
+#ifdef CONFIG_SND_SOC_TFA98XX
+		.be_hw_params_fixup = msm_mi2s_rx_tfa98xx_be_hw_params_fixup,
+#else
 		.be_hw_params_fixup = msm_mi2s_rx_be_hw_params_fixup,
+#endif
 		.ops = &msm8952_quat_mi2s_be_ops,
 		.ignore_pmdown_time = 1, /* dai link has playback support */
 		.ignore_suspend = 1,
