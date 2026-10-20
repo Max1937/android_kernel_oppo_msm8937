@@ -109,7 +109,8 @@ jobs:
           # 本仓库面向 OPPO，不启用任何 Xiaomi 机型，但该符号仍必须为 y，
           # 让 qpnp-fg 走 xiaomi_msm8953_mach_get() 返回 UNKNOWN 的分支。
           BASE_FRAGMENTS = "vendor/mi8953.config"
-          OPPO = "vendor/oppo-16017.config"
+          COMMON = "vendor/oppo-common.config"
+          R9S = "vendor/oppo-r9s.config"
           # 纯净版：显式关掉 KernelSU（config KSU 是 default y，
           # 不关的话编出来一定自带 BakaSU）。
           NOKSU = "vendor/oppo-no-ksu.config"
@@ -130,7 +131,7 @@ jobs:
               # 默认目标：纯净内核（无 root），用于验证功能修复
               "target": "R9s", "label": "R9s (clean, no root)",
               "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": BASE_FRAGMENTS + " " + OPPO + " " + NOKSU + " " + BPFC,
+              "fragments": BASE_FRAGMENTS + " " + COMMON + " " + R9S + " " + NOKSU + " " + BPFC,
               "device_names": "r9s|R9s|16017|16027|msm8953",
               "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": True,
@@ -139,20 +140,22 @@ jobs:
               # 保留一份带 KernelSU 的产物，便于对照/将来合入
               "target": "R9s-ksu", "label": "R9s (with KernelSU)",
               "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": BASE_FRAGMENTS + " " + OPPO,
+              "fragments": BASE_FRAGMENTS + " " + COMMON + " " + R9S,
               "device_names": "r9s|R9s|16017|16027|msm8953",
               "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": True,
             },
             {
-              # A57 (MSM8940 / 16061) + 保留 R9s 两机型。
-              # 同一份 Image.gz-dtb 里打包 3 个 DTB：
-              #   16017 / 16027 (MSM8953) 与 16061 (MSM8940)，
-              #   ABL 按 board-id <8 0 xxxxx> 自动选择，互不干扰。
-              "target": "A57", "label": "A57 + R9s (clean, no root)",
+              # A57 (MSM8940 / 16061) 独立构建。
+              # 为什么不能和 R9s 合进同一个内核：两者触摸屏驱动
+              # （Goodix GT5688 vs Synaptics S3320）各自导出同名全局符号
+              # （is_gesture_enable_for_lcd / lcd_wakeup_finger_protect /
+              #   touchkey_enabled），同时在编会 multiple definition。
+              # 4.9 分支本来也是 A57/R9s 两份 defconfig 分开编译的。
+              "target": "A57", "label": "A57 (clean, no root)",
               "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": BASE_FRAGMENTS + " " + OPPO + " " + A57 + " " + NOKSU + " " + BPFC,
-              "device_names": "a57|A57|16061|msm8940|msm8937|r9s|R9s|16017|16027|msm8953",
+              "fragments": BASE_FRAGMENTS + " " + COMMON + " " + A57 + " " + NOKSU + " " + BPFC,
+              "device_names": "a57|A57|16061|msm8940|msm8937",
               "soc": "MSM8940", "snapdragon": "Snapdragon 435",
               "allow_fail": True,
             },
