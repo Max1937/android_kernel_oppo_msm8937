@@ -116,6 +116,8 @@ jobs:
           # BPF + 容器（droidspaces）支持：完整 namespace 全集、
           # cgroup 控制器、BPF 显式重申。详见该 fragment 头部注释。
           BPFC = "vendor/oppo-bpf-containers.config"
+          # OPPO A57 (16061 / MSM8940) 机型片段
+          A57 = "vendor/oppo-a57.config"
           targets = [
             {
               "target": "base", "label": "4.19 base smoke",
@@ -140,6 +142,18 @@ jobs:
               "fragments": BASE_FRAGMENTS + " " + OPPO,
               "device_names": "r9s|R9s|16017|16027|msm8953",
               "soc": "MSM8953", "snapdragon": "Snapdragon 625",
+              "allow_fail": True,
+            },
+            {
+              # A57 (MSM8940 / 16061) + 保留 R9s 两机型。
+              # 同一份 Image.gz-dtb 里打包 3 个 DTB：
+              #   16017 / 16027 (MSM8953) 与 16061 (MSM8940)，
+              #   ABL 按 board-id <8 0 xxxxx> 自动选择，互不干扰。
+              "target": "A57", "label": "A57 + R9s (clean, no root)",
+              "defconfig": "vendor/msm8953-perf_defconfig",
+              "fragments": BASE_FRAGMENTS + " " + OPPO + " " + A57 + " " + NOKSU + " " + BPFC,
+              "device_names": "a57|A57|16061|msm8940|msm8937|r9s|R9s|16017|16027|msm8953",
+              "soc": "MSM8940", "snapdragon": "Snapdragon 435",
               "allow_fail": True,
             },
           ]

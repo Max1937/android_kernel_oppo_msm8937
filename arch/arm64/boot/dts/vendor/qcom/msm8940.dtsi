@@ -207,7 +207,12 @@
 
 };
 
-#ifdef CONFIG_COMMON_CLK_MSM
+/*
+ * MSM8940 的时钟控制器 compatible 覆盖。
+ * 固定使用老时钟框架（clock_gcc / clock_debug / clock_gcc_mdss）——
+ * 本仓库 DTS 预处理带 -undef、拿不到 CONFIG_ 宏，
+ * 上游这里的 #ifdef 会恒假，故去掉条件并删除 #else 分支。
+ */
 &clock_gcc {
 	compatible = "qcom,gcc-8940";
 };
@@ -219,15 +224,6 @@
 &clock_gcc_mdss {
 	compatible = "qcom,gcc-mdss-8940";
 };
-#else
-&gcc {
-	compatible = "qcom,gcc-msm8940";
-};
-
-&rpmcc {
-	compatible = "qcom,rpmcc-msm8940";
-};
-#endif
 
 &bam_dmux {
 	status = "disabled";
