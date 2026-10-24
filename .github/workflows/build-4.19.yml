@@ -137,12 +137,8 @@ jobs:
               "allow_fail": True,
             },
             {
-              # ⚠ 注意：这是 4.19 基线里**旧版 KernelSU**（drivers/kernelsu，
-              #   KSU_VERSION 32567，**不含 SUSFS**），不是 BakaSU。
-              #   需要 BakaSU + SUSFS 请刷 bakasu-k4.19 分支的 "R9s-ksu"
-              #   （那份才带 KernelSU/ 源码 + oppo-bakasu-susfs.config）。
-              #   保留这个目标只是为了对照/将来合入。
-              "target": "R9s-ksu", "label": "R9s (legacy KernelSU, NO SUSFS)",
+              # 保留一份带 KernelSU 的产物，便于对照/将来合入
+              "target": "R9s-ksu", "label": "R9s (with KernelSU)",
               "defconfig": "vendor/msm8953-perf_defconfig",
               "fragments": BASE_FRAGMENTS + " " + COMMON + " " + R9S,
               "device_names": "r9s|R9s|16017|16027|msm8953",
