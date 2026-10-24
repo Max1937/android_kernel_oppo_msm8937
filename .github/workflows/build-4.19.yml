@@ -119,28 +119,26 @@ jobs:
           BPFC = "vendor/oppo-bpf-containers.config"
           # OPPO A57 (16061 / MSM8940) 机型片段
           A57 = "vendor/oppo-a57.config"
+          # 每个分支只构建自己的产物：lineage-22.1-k4.19 出纯净内核，
+          # bakasu-k4.19 出 BakaSU + SUSFS。靠下面的 branch 字段过滤，
+          # ci/targets 只是在**本分支的目标里**再选子集（可留空）。
+          BRANCH = os.environ.get("GITHUB_REF_NAME", "")
           targets = [
             {
               "target": "base", "label": "4.19 base smoke",
+              "branch": "lineage-22.1-k4.19",
               "defconfig": "vendor/msm8953-perf_defconfig",
               "fragments": BASE_FRAGMENTS,
               "device_names": "", "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": False,
             },
             {
-              # 默认目标：纯净内核（无 root），用于验证功能修复
+              # 纯净内核（无 root）。config 里 KSU 是 default y，
+              # 不显式关掉的话编出来一定自带 KernelSU。
               "target": "R9s", "label": "R9s (clean, no root)",
+              "branch": "lineage-22.1-k4.19",
               "defconfig": "vendor/msm8953-perf_defconfig",
               "fragments": BASE_FRAGMENTS + " " + COMMON + " " + R9S + " " + NOKSU + " " + BPFC,
-              "device_names": "r9s|R9s|16017|16027|msm8953",
-              "soc": "MSM8953", "snapdragon": "Snapdragon 625",
-              "allow_fail": True,
-            },
-            {
-              # 保留一份带 KernelSU 的产物，便于对照/将来合入
-              "target": "R9s-ksu", "label": "R9s (with KernelSU)",
-              "defconfig": "vendor/msm8953-perf_defconfig",
-              "fragments": BASE_FRAGMENTS + " " + COMMON + " " + R9S,
               "device_names": "r9s|R9s|16017|16027|msm8953",
               "soc": "MSM8953", "snapdragon": "Snapdragon 625",
               "allow_fail": True,
@@ -153,6 +151,7 @@ jobs:
               #   touchkey_enabled），同时在编会 multiple definition。
               # 4.9 分支本来也是 A57/R9s 两份 defconfig 分开编译的。
               "target": "A57", "label": "A57 (clean, no root)",
+              "branch": "lineage-22.1-k4.19",
               "defconfig": "vendor/msm8953-perf_defconfig",
               "fragments": BASE_FRAGMENTS + " " + COMMON + " " + A57 + " " + NOKSU + " " + BPFC,
               "device_names": "a57|A57|16061|msm8940|msm8937",
@@ -161,11 +160,22 @@ jobs:
             },
           ]
 
+          # 先按分支过滤：一个分支只出自己的产物
+          on_branch = [t for t in targets if t.get("branch", "any") in ("any", BRANCH)]
+
+          # ci/targets 再选子集；若指定的目标不属于本分支（比如在 bakasu
+          # 上写了 "R9s"），忽略它并构建本分支全部目标，避免静默出错。
           want = [s.strip() for s in (sys.argv[1] if len(sys.argv) > 1 else "").split(",") if s.strip()]
           if want:
-              targets = [t for t in targets if t["target"] in want]
+              picked = [t for t in on_branch if t["target"] in want]
+              if picked:
+                  on_branch = picked
+              else:
+                  print("# ci/targets=%r 在本分支 %s 上没有匹配目标，改为构建全部：%s"
+                        % (",".join(want), BRANCH, ", ".join(t["target"] for t in on_branch)),
+                        file=sys.stderr)
 
-          print(json.dumps({"include": targets}))
+          print(json.dumps({"include": on_branch}))
           PYEOF
 
           MATRIX="$(cat matrix.json)"
