@@ -23,6 +23,21 @@
 			reg = <0x0 0x84a00000 0x0 0x1E00000>;
 		};
 
+		/*
+		 * LOS22 的 adsp.mdt 需 0x1200000，而 msm8937 基础值仅 0x1100000，
+		 * 导致 "Failed to allocate relocatable region" -> ADSP 加载失败 ->
+		 * pmic_analog_codec 一直 defer -> No soundcards found。
+		 * 与 oppo-msm8953/msm8953.dtsi 保持一致：adsp 区 0x1400000，
+		 * wcnss 起始相应后移 0x300000。
+		 */
+		adsp_fw_mem: adsp_fw_region@0 {
+			reg = <0x0 0x8b800000 0x0 0x1400000>;
+		};
+
+		wcnss_fw_mem: wcnss_fw_region@0 {
+			reg = <0x0 0x8cc00000 0x0 0x700000>;
+		};
+
 		ramoops: ramoops@b0000000 {
 			compatible = "ramoops";
 			reg = <0 0xb0000000 0 0x800000>;
