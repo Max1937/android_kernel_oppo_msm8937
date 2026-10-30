@@ -139,6 +139,9 @@ static int dsi_core_clk_stop(struct dsi_core_clks *c_clks)
 	return 0;
 }
 
+extern int mdss_dsi_pll_lpm_set_vco_rate0(unsigned long rate);
+extern unsigned long mdss_dsi_pll_lpm_get_vco_rate0(void);
+
 static int dsi_link_hs_clk_set_rate(
 	struct mdss_dsi_link_hs_clk_info *link_hs_clks)
 {
@@ -164,8 +167,40 @@ static int dsi_link_hs_clk_set_rate(
 
 	rc = clk_set_rate(link_hs_clks->byte_clk, link_hs_clks->byte_clk_rate);
 	if (rc) {
-		pr_err("clk_set_rate failed for byte_clk rc = %d\n", rc);
-		goto error;
+		unsigned long vco_rate = mdss_dsi_pll_lpm_get_vco_rate0();
+		int mult;
+
+		pr_err("clk_set_rate failed for byte_clk rc = %d req = %u vco_cached = %lu\n",
+			rc, link_hs_clks->byte_clk_rate, vco_rate);
+
+		/*
+		 * The fixed /4 byte divider rejects the request unless the cached
+		 * VCO rate matches 4x (direct) or 8x (indirect /2) the panel byte
+		 * clock. Re-program the PLL and retry before giving up.
+		 */
+		for (mult = 4; mult <= 8; mult += 4) {
+			unsigned long want =
+				(unsigned long)link_hs_clks->byte_clk_rate * mult;
+
+			if (vco_rate == want)
+				continue;
+			rc = mdss_dsi_pll_lpm_set_vco_rate0(want);
+			if (rc) {
+				pr_err("vco reprogram %dx failed rc = %d\n", mult, rc);
+				continue;
+			}
+			rc = clk_set_rate(link_hs_clks->byte_clk,
+				link_hs_clks->byte_clk_rate);
+			if (!rc) {
+				pr_err("byte_clk recovered via %dx VCO\n", mult);
+				break;
+			}
+			pr_err("byte_clk retry at %dx VCO rc = %d\n", mult, rc);
+		}
+		if (rc) {
+			pr_err("clk_set_rate for byte_clk unrecovered rc = %d\n", rc);
+			goto error;
+		}
 	}
 
 	rc = clk_set_rate(link_hs_clks->pixel_clk, link_hs_clks->pix_clk_rate);
