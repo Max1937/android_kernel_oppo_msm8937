@@ -520,3 +520,24 @@ int dsi_pll_clock_register_lpm(struct platform_device *pdev,
 
 	return rc;
 }
+
+/*
+ * Public accessors for the DSI clock manager (primary PLL only).
+ *
+ * The fixed /4 byte divider rejects clk_set_rate() unless the cached VCO
+ * rate is exactly 4x (direct path) or 8x (indirect /2 path) the panel byte
+ * clock. After a suspend/resume cycle the handoff-cached VCO rate can be
+ * stale for such panels; let the clock manager inspect and re-program the
+ * PLL before retrying the divider.
+ */
+unsigned long mdss_dsi_pll_lpm_get_vco_rate0(void)
+{
+	return clk_get_rate(&dsi_pll0_vco_clk.c);
+}
+EXPORT_SYMBOL(mdss_dsi_pll_lpm_get_vco_rate0);
+
+int mdss_dsi_pll_lpm_set_vco_rate0(unsigned long rate)
+{
+	return clk_set_rate(&dsi_pll0_vco_clk.c, rate);
+}
+EXPORT_SYMBOL(mdss_dsi_pll_lpm_set_vco_rate0);
