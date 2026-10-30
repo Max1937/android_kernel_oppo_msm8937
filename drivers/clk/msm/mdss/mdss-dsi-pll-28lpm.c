@@ -14,6 +14,7 @@
 #define pr_fmt(fmt)	"%s: " fmt, __func__
 
 #include <linux/kernel.h>
+#include <linux/clk.h>
 #include <linux/err.h>
 #include <linux/delay.h>
 #include <linux/clk/msm-clk.h>
