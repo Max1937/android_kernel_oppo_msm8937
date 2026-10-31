@@ -59,6 +59,9 @@ static struct mutex quin_mclk_lock;
 static atomic_t auxpcm_mi2s_clk_ref;
 static struct snd_info_entry *codec_root;
 
+extern int msm_anlg_cdc_mclk_enable(struct snd_soc_component *component,
+				     int mclk_enable, bool dapm);
+
 static int msm8952_enable_dig_cdc_clk(struct snd_soc_component *component,
 					int enable, bool dapm);
 static bool msm8952_swap_gnd_mic(struct snd_soc_component *component,
@@ -1327,6 +1330,24 @@ static int msm_mi2s_snd_startup(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		pr_err("%s: set fmt cpu dai failed; ret=%d\n", __func__, ret);
 
+	/*
+	 * 4.9 parity: the msm8x16 machine driver called
+	 * msm8x16_wcd_mclk_enable(codec, 1, true) here, which runs the
+	 * PMIC clock block and raises A_CDC_CLK_PDM_CTL (the clock that
+	 * drives the PDM bus to the analog codec). Its 4.19 counterpart is
+	 * msm_anlg_cdc_mclk_enable, which raises DIG_CDC_EVENT_CLK_ON and
+	 * sets CDC_CORE_CLK_PDM_CTL. The fork dropped this call, so the
+	 * speaker gets no PDM clock and stays silent.
+	 */
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+	    pdata->snd_card_val == INT_SND_CARD) {
+		struct snd_soc_component *anlg_cdc =
+			rtd->codec_dais[ANA_CDC]->component;
+
+		if (anlg_cdc)
+			msm_anlg_cdc_mclk_enable(anlg_cdc, 1, true);
+	}
+
 	return ret;
 }
 
@@ -1335,6 +1356,7 @@ static void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	int ret;
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct snd_soc_card *card = rtd->card;
+	struct msm_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
 
 	pr_debug("%s(): substream = %s  stream = %d\n", __func__,
 			substream->name, substream->stream);
@@ -1343,6 +1365,14 @@ static void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		pr_err("%s:clock disable failed; ret=%d\n", __func__,
 				ret);
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+	    pdata->snd_card_val == INT_SND_CARD) {
+		struct snd_soc_component *anlg_cdc =
+			rtd->codec_dais[ANA_CDC]->component;
+
+		if (anlg_cdc)
+			msm_anlg_cdc_mclk_enable(anlg_cdc, 0, true);
+	}
 	if (card->aux_dev && substream->stream ==
 			SNDRV_PCM_STREAM_PLAYBACK) {
 		ret = msm8952_enable_wsa_mclk(card, false);
