@@ -1827,6 +1827,15 @@ enum led_brightness qpnp_haptics_brightness_get(struct led_classdev *cdev)
 static void qpnp_haptics_brightness_set(struct led_classdev *cdev,
 					enum led_brightness level)
 {
+	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
+
+	/*
+	 * The AIDL vibrator HAL (LedVibratorDevice) drives this led class
+	 * node: write a non-zero brightness to start playing and 0 to
+	 * stop.  The empty stub left the haptics module permanently
+	 * disabled, so the phone never vibrated.
+	 */
+	qpnp_haptics_play(chip, level ? true : false);
 }
 
 static int qpnp_haptics_config(struct hap_chip *chip)
