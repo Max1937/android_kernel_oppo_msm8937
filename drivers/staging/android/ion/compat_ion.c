@@ -229,6 +229,17 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		return ion_flush_buffer_fd(fd, dir);
 	}
+	case COMPAT_ION_IOC_CUSTOM:
+	{
+		struct compat_ion_custom_data __user *d32 = compat_ptr(arg);
+		compat_uint_t mcmd;
+		compat_uptr_t uarg;
+
+		if (copy_from_user(&mcmd, &d32->cmd, sizeof(mcmd)) ||
+		    copy_from_user(&uarg, &d32->arg, sizeof(uarg)))
+			return -EFAULT;
+		return ion_legacy_cache_op(mcmd, (unsigned long)uarg);
+	}
 	default:
 		/*
 		 * Legacy Qualcomm flush commands. The vendor gralloc was
@@ -263,16 +274,5 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			return ion_flush_buffer_fd(fd, dir);
 		}
 		return -ENOIOCTLCMD;
-	}
-	case COMPAT_ION_IOC_CUSTOM:
-	{
-		struct compat_ion_custom_data __user *d32 = compat_ptr(arg);
-		compat_uint_t mcmd;
-		compat_uptr_t uarg;
-
-		if (copy_from_user(&mcmd, &d32->cmd, sizeof(mcmd)) ||
-		    copy_from_user(&uarg, &d32->arg, sizeof(uarg)))
-			return -EFAULT;
-		return ion_legacy_cache_op(mcmd, (unsigned long)uarg);
 	}
 }
