@@ -194,6 +194,7 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case ION_IOC_MAP:
 	case ION_IOC_IMPORT:
 	case ION_IOC_SYNC:
+	case ION_IOC_SYNC_LEGACY:
 	case ION_IOC_ALLOC:
 	case ION_IOC_HEAP_QUERY:
 	case ION_IOC_PREFETCH:
