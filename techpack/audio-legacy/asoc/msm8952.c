@@ -393,6 +393,20 @@ int is_ext_spk_gpio_support(struct platform_device *pdev,
 	pdata->spk_ext_pa_gpio = of_get_named_gpio(pdev->dev.of_node,
 				spk_ext_pa, 0);
 
+	/*
+	 * OPPO 的 DTB 用自家属性名 oppo-spk-pa-en 描述外置扬声器功放使能脚，
+	 * 4.19 移植只保留了 QC 的 qcom,msm-spk-ext-pa。拿不到 GPIO 时
+	 * enable_spk_ext_pa() 会直接返回，功放永不使能 —— 表现为播放时
+	 * DAPM 全部上电、寄存器全对，但扬声器完全没有声音。
+	 */
+	if (pdata->spk_ext_pa_gpio < 0) {
+		pdata->spk_ext_pa_gpio = of_get_named_gpio(pdev->dev.of_node,
+					"oppo-spk-pa-en", 0);
+		if (pdata->spk_ext_pa_gpio >= 0)
+			pr_info("%s: falling back to oppo-spk-pa-en gpio %d\n",
+				__func__, pdata->spk_ext_pa_gpio);
+	}
+
 	if (pdata->spk_ext_pa_gpio < 0) {
 		dev_err(&pdev->dev,
 			"%s: missing %s in dt node\n", __func__, spk_ext_pa);
@@ -437,11 +451,14 @@ static int enable_spk_ext_pa(struct snd_soc_component *component, int enable)
             }
         } else {
 			int ret;
-            ret = msm_cdc_pinctrl_select_active_state(pdata->spk_ext_pa_gpio_p);
-            if (ret) {
-                pr_err("%s: gpio set cannot be activated %s\n",
-                        __func__, "ext_spk_gpio");
-                return ret;
+            if (pdata->spk_ext_pa_gpio_p) {
+                ret = msm_cdc_pinctrl_select_active_state(
+                        pdata->spk_ext_pa_gpio_p);
+                if (ret) {
+                    pr_err("%s: gpio set cannot be activated %s\n",
+                            __func__, "ext_spk_gpio");
+                    return ret;
+                }
             }
             gpio_set_value_cansleep(pdata->spk_ext_pa_gpio, enable);
         }
@@ -450,11 +467,14 @@ static int enable_spk_ext_pa(struct snd_soc_component *component, int enable)
         
         if (!is_mido) {
 			int ret;
-            ret = msm_cdc_pinctrl_select_sleep_state(pdata->spk_ext_pa_gpio_p);
-            if (ret) {
-                pr_err("%s: gpio set cannot be de-activated %s\n",
-                        __func__, "ext_spk_gpio");
-                return ret;
+            if (pdata->spk_ext_pa_gpio_p) {
+                ret = msm_cdc_pinctrl_select_sleep_state(
+                        pdata->spk_ext_pa_gpio_p);
+                if (ret) {
+                    pr_err("%s: gpio set cannot be de-activated %s\n",
+                            __func__, "ext_spk_gpio");
+                    return ret;
+                }
             }
         }
     }
@@ -1225,6 +1245,95 @@ static const struct soc_enum msm_snd_enum[] = {
 				mi2s_rx_sample_rate_text),
 };
 
+/*
+ * OPPO 私有控件：mixer_paths_mtp.xml 的 speaker / headphones 路径会写
+ * Ext_SPK_Switch 和 Ext_HP_Switch，用来拉外部功放使能脚。4.9 树由
+ * oppo_audio_custom.c 提供，4.19 移植时丢失，导致 audio_route 写控件失败、
+ * 外置功放永不使能，扬声器无声。
+ */
+static const char * const oppo_pa_text[] = {"DISABLE", "ENABLE"};
+static const struct soc_enum oppo_pa_enum[] = {
+	SOC_ENUM_SINGLE_EXT(ARRAY_SIZE(oppo_pa_text), oppo_pa_text),
+};
+
+static struct oppo_pa_gpio {
+	const char *prop;
+	int gpio;
+	int state;
+} oppo_pa_gpios[] = {
+	{ "oppo-spk-pa-en", -1, -1 },
+	{ "oppo-hp-pa-en",  -1, -1 },
+};
+
+static int oppo_pa_apply(int idx, int enable)
+{
+	struct oppo_pa_gpio *pa = &oppo_pa_gpios[idx];
+	struct device_node *np;
+	int gpio, ret;
+
+	if (pa->gpio < 0) {
+		np = of_find_node_by_path("/soc/sound");
+		if (!np)
+			np = of_find_compatible_node(NULL, NULL,
+						"qcom,msm8952-audio-codec");
+		if (!np) {
+			pr_err("%s: no audio codec node, cannot drive %s\n",
+			       __func__, pa->prop);
+			return -ENODEV;
+		}
+		gpio = of_get_named_gpio(np, pa->prop, 0);
+		of_node_put(np);
+		if (!gpio_is_valid(gpio)) {
+			pr_err("%s: %s not found in dt\n", __func__, pa->prop);
+			return -EINVAL;
+		}
+		ret = gpio_request(gpio, pa->prop);
+		if (ret)
+			pr_warn("%s: gpio %d request rc=%d, driving anyway\n",
+				__func__, gpio, ret);
+		gpio_direction_output(gpio, 0);
+		pa->gpio = gpio;
+		pa->state = 0;
+		pr_info("%s: %s -> gpio %d\n", __func__, pa->prop, gpio);
+	}
+
+	if (pa->state != !!enable) {
+		gpio_set_value_cansleep(pa->gpio, !!enable);
+		pa->state = !!enable;
+		pr_info("%s: %s %s\n", __func__, pa->prop,
+			enable ? "ENABLE" : "DISABLE");
+	}
+	return 0;
+}
+
+static int oppo_spk_switch_get(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = oppo_pa_gpios[0].state > 0;
+	return 0;
+}
+
+static int oppo_spk_switch_put(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	oppo_pa_apply(0, ucontrol->value.integer.value[0]);
+	return 0;
+}
+
+static int oppo_hp_switch_get(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = oppo_pa_gpios[1].state > 0;
+	return 0;
+}
+
+static int oppo_hp_switch_put(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_value *ucontrol)
+{
+	oppo_pa_apply(1, ucontrol->value.integer.value[0]);
+	return 0;
+}
+
 static const struct snd_kcontrol_new msm_snd_controls[] = {
 	SOC_ENUM_EXT("MI2S_RX Format", msm_snd_enum[0],
 			mi2s_rx_bit_format_get, mi2s_rx_bit_format_put),
@@ -1242,6 +1351,10 @@ static const struct snd_kcontrol_new msm_snd_controls[] = {
 			msm_vi_feed_tx_ch_get, msm_vi_feed_tx_ch_put),
 	SOC_ENUM_EXT("MI2S_RX SampleRate", msm_snd_enum[6],
 			mi2s_rx_sample_rate_get, mi2s_rx_sample_rate_put),
+	SOC_ENUM_EXT("Ext_SPK_Switch", oppo_pa_enum[0],
+			oppo_spk_switch_get, oppo_spk_switch_put),
+	SOC_ENUM_EXT("Ext_HP_Switch", oppo_pa_enum[0],
+			oppo_hp_switch_get, oppo_hp_switch_put),
 };
 
 static int msm8952_enable_wsa_mclk(struct snd_soc_card *card, bool enable)
