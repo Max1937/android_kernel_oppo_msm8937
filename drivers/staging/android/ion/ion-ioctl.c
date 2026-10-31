@@ -219,6 +219,13 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case ION_IOC_IMPORT:
 		data.fd.handle = data.fd.fd;
 		break;
+	case ION_IOC_SYNC:
+		/*
+		 * 4.9 ion_sync_for_device() pushed the cpu cache contents
+		 * of the whole dmabuf towards the device.
+		 */
+		ret = ion_flush_buffer_fd(data.fd.fd, DMA_BIDIRECTIONAL);
+		break;
 #endif
 	default:
 		return -ENOTTY;
