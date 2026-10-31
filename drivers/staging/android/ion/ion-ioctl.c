@@ -59,6 +59,52 @@ int ion_flush_buffer_fd(int fd, enum dma_data_direction dir)
 	return 0;
 }
 
+#ifdef CONFIG_ION_LEGACY
+/*
+ * Vendor cache maintenance dispatched through ION_IOC_CUSTOM: mcmd is
+ * one of the M-magic flush ioctls (direction in the command number),
+ * uarg points at the vendor ion_flush_data whose first field is the
+ * dmabuf fd.
+ */
+int ion_legacy_cache_op(unsigned int mcmd, unsigned long uarg)
+{
+	struct ion_flush_data flush;
+	enum dma_data_direction dir;
+	unsigned int sz;
+	int fd;
+
+	if (_IOC_TYPE(mcmd) != ION_IOC_MSM_MAGIC)
+		return -ENOTTY;
+
+	switch (_IOC_NR(mcmd)) {
+	case 0:
+		dir = DMA_TO_DEVICE;
+		break;
+	case 1:
+		dir = DMA_FROM_DEVICE;
+		break;
+	case 2:
+		dir = DMA_BIDIRECTIONAL;
+		break;
+	default:
+		return -ENOTTY;
+	}
+
+	memset(&flush, 0, sizeof(flush));
+	sz = _IOC_SIZE(mcmd);
+	if (sz > sizeof(flush))
+		sz = sizeof(flush);
+	if (sz && copy_from_user(&flush, (void __user *)uarg, sz))
+		return -EFAULT;
+
+	fd = flush.handle;	/* vendor flush_data: fd comes first */
+	if (!fd)
+		fd = flush.fd;	/* tolerate the uapi field order */
+
+	return ion_flush_buffer_fd(fd, dir);
+}
+#endif
+
 union ion_ioctl_arg {
 	struct ion_allocation_data allocation;
 	struct ion_heap_query query;
@@ -66,7 +112,7 @@ union ion_ioctl_arg {
 	struct ion_flush_data flush;
 #ifdef CONFIG_ION_LEGACY
 	struct ion_fd_data fd;
-	struct ion_fd_data_legacy fd_legacy;
+	struct ion_custom_data custom;
 	struct ion_old_allocation_data old_allocation;
 	struct ion_handle_data handle;
 #endif
@@ -233,18 +279,14 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = ion_flush_buffer_fd(data.fd.handle,
 						  DMA_BIDIRECTIONAL);
 		break;
-	case ION_IOC_SYNC_LEGACY:
+		case ION_IOC_CUSTOM:
 		/*
-		 * 4.9 vendor userspace syncs with cmd nr 6 over the
-		 * 16-byte ion_fd_data_legacy; same semantics as the
-		 * nr 7 form above.
+		 * 4.9 vendor gralloc/memalloc wraps the M-magic flush
+		 * commands in ION_IOC_CUSTOM; the referenced flush data
+		 * has the dmabuf fd in its first field.
 		 */
-		if (data.fd_legacy.fd)
-			ret = ion_flush_buffer_fd(data.fd_legacy.fd,
-						  DMA_BIDIRECTIONAL);
-		else
-			ret = ion_flush_buffer_fd(data.fd_legacy.handle,
-						  DMA_BIDIRECTIONAL);
+		ret = ion_legacy_cache_op(data.custom.cmd,
+					  data.custom.arg);
 		break;
 #endif
 	default:
