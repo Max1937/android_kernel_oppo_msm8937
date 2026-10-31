@@ -1832,10 +1832,14 @@ static void qpnp_haptics_brightness_set(struct led_classdev *cdev,
 	/*
 	 * The AIDL vibrator HAL (LedVibratorDevice) drives this led class
 	 * node: write a non-zero brightness to start playing and 0 to
-	 * stop.  The empty stub left the haptics module permanently
-	 * disabled, so the phone never vibrated.
+	 * stop.  Route through haptics_work like the sysfs/debugfs paths
+	 * do: haptics_work enables the vcc_pon regulator (pon_spare,
+	 * which feeds the LRA) *before* playing; calling play directly
+	 * left the rail disabled, PLAY writes were rejected and the phone
+	 * stayed silent.
 	 */
-	qpnp_haptics_play(chip, level ? true : false);
+	atomic_set(&chip->state, level ? 1 : 0);
+	schedule_work(&chip->haptics_work);
 }
 
 static int qpnp_haptics_config(struct hap_chip *chip)
