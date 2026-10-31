@@ -645,8 +645,6 @@ static int pm8916_wcd_analog_enable_adc(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
-extern void oppo_spk_pa_enable(int enable);
-
 static int pm8916_wcd_analog_enable_spk_pa(struct snd_soc_dapm_widget *w,
 					    struct snd_kcontrol *kcontrol,
 					    int event)
@@ -676,15 +674,6 @@ static int pm8916_wcd_analog_enable_spk_pa(struct snd_soc_dapm_widget *w,
 		snd_soc_component_update_bits(component, w->reg,
 				    SPKR_DRV_CLASSD_PA_EN_MASK,
 				    SPKR_DRV_CLASSD_PA_EN_ENABLE);
-		/*
-		 * 内部 PA 起来之后再打开外置功放，避免 pop；
-		 * 与 4.9 oppo_audio_custom 的行为一致。
-		 */
-		oppo_spk_pa_enable(1);
-		break;
-	case SND_SOC_DAPM_PRE_PMD:
-		/* 先关外置功放，再关内部 PA */
-		oppo_spk_pa_enable(0);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		snd_soc_component_update_bits(component, CDC_A_SPKR_PWRSTG_CTL,
