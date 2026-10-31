@@ -15,6 +15,8 @@
 
 #include <linux/module.h>
 #include <linux/of_gpio.h>
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h>
 #include "msm_flash.h"
 #include "msm_camera_dt_util.h"
 #include "msm_cci.h"
@@ -110,6 +112,99 @@ static struct led_classdev msm_torch_led[MAX_LED_TRIGGERS] = {
 		.brightness	= LED_OFF,
 	},
 };
+
+/*
+ * /proc/qcom_flash
+ *
+ * Vendor mm-camera HAL (libmmcamera2_sensor_modules.so) opens this node to
+ * drive the torch and, when a session ends, reads it back so it can force the
+ * LED off if it was left on.  The 4.9 tree carried this as a local patch
+ * (kernel release string ends in -dirty) that never reached the 4.19 port, so
+ * the node was missing and the HAL logged "open qcom_flash failed" - which
+ * left the back camera without a flash unit and made a stuck torch
+ * impossible to clear.
+ */
+static int qcom_flash_torch_state;
+
+static ssize_t qcom_flash_proc_read(struct file *file, char __user *buff,
+				    size_t count, loff_t *ppos)
+{
+	char kbuf[8];
+	int len;
+
+	if (*ppos)
+		return 0;
+
+	len = scnprintf(kbuf, sizeof(kbuf), "%d\n", qcom_flash_torch_state);
+	if (len > count)
+		len = count;
+	if (len && copy_to_user(buff, kbuf, len))
+		return -EFAULT;
+
+	*ppos += len;
+	return len;
+}
+
+static ssize_t qcom_flash_proc_write(struct file *file,
+				     const char __user *buff,
+				     size_t count, loff_t *ppos)
+{
+	char kbuf[32];
+	size_t orig = count;
+	long val = 0;
+	int rc;
+
+	if (!count)
+		return -EINVAL;
+	if (count > sizeof(kbuf) - 1)
+		count = sizeof(kbuf) - 1;
+
+	if (copy_from_user(kbuf, buff, count))
+		return -EFAULT;
+	kbuf[count] = '\0';
+
+	/* 先无条件记录 HAL 传来的原始字节，第一版就用它确认真实协议 */
+	pr_info("%s: HAL wrote %zu byte(s): %*ph\n", __func__, orig,
+		(int)(orig > sizeof(kbuf) - 1 ? sizeof(kbuf) - 1 : orig), kbuf);
+
+	rc = kstrtol(kbuf, 0, &val);
+	if (rc) {
+		pr_err("%s: proc write error, can not parse %*ph\n", __func__,
+		       (int)(orig > sizeof(kbuf) - 1 ? sizeof(kbuf) - 1 : orig),
+		       kbuf);
+		return -EINVAL;
+	}
+
+	qcom_flash_torch_state = val ? 1 : 0;
+
+	if (!torch_trigger) {
+		pr_err("%s: no torch trigger available, LED left untouched\n",
+		       __func__);
+		return orig;
+	}
+
+	/* 非 0 一律给最亮，避免 HAL 传 1 时电流档为 0 反而看不到灯 */
+	led_trigger_event(torch_trigger, val ? LED_FULL : LED_OFF);
+
+	return orig;
+}
+
+static const struct file_operations qcom_flash_proc_fops = {
+	.owner	= THIS_MODULE,
+	.read	= qcom_flash_proc_read,
+	.write	= qcom_flash_proc_write,
+};
+
+static int __init qcom_flash_proc_init(void)
+{
+	if (!proc_create("qcom_flash", 0666, NULL, &qcom_flash_proc_fops)) {
+		pr_err("%s: Error! Couldn't create qcom_flash proc entry\n",
+		       __func__);
+		return -ENOMEM;
+	}
+	pr_info("%s: /proc/qcom_flash registered\n", __func__);
+	return 0;
+}
 
 #if IS_ENABLED(CONFIG_MACH_XIAOMI_VINCE)
 static void msm_flashlight_brightness_vince_set(struct led_classdev *led_cdev,
@@ -1424,6 +1519,8 @@ static int __init msm_flash_init_module(void)
 	if (!camera_legacy_enable)
 		return -ENODEV;
 	CDBG("Enter\n");
+	if (qcom_flash_proc_init())
+		pr_err("%s: /proc/qcom_flash init failed\n", __func__);
 #if IS_ENABLED(CONFIG_MACH_XIAOMI_VINCE)
 	if (xiaomi_msm8953_mach_get() == XIAOMI_MSM8953_MACH_VINCE) {
         flashlight_ctrl = NULL;
