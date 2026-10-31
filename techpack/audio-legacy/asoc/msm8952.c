@@ -1257,52 +1257,90 @@ static const struct soc_enum oppo_pa_enum[] = {
 };
 
 static struct oppo_pa_gpio {
-	const char *prop;
+	const char *prop;		/* 功放主使能脚 */
+	const char *boost_prop;		/* 需先拉起的 boost/偏置脚，可为 NULL */
 	int gpio;
+	int boost_gpio;
 	int state;
 } oppo_pa_gpios[] = {
-	{ "oppo-spk-pa-en", -1, -1 },
-	{ "oppo-hp-pa-en",  -1, -1 },
+	{ "oppo-spk-pa-en", "oppo-spk-boost-en", -1, -1, -1 },
+	{ "oppo-hp-pa-en",  NULL,                -1, -1, -1 },
 };
+
+static int oppo_pa_gpio_lookup(const char *prop)
+{
+	struct device_node *np;
+	int gpio, ret;
+
+	np = of_find_node_by_path("/soc/sound");
+	if (!np)
+		np = of_find_compatible_node(NULL, NULL,
+					     "qcom,msm8952-audio-codec");
+	if (!np) {
+		pr_err("%s: no audio codec node for %s\n", __func__, prop);
+		return -ENODEV;
+	}
+
+	gpio = of_get_named_gpio(np, prop, 0);
+	of_node_put(np);
+	if (!gpio_is_valid(gpio)) {
+		pr_err("%s: %s not found in dt\n", __func__, prop);
+		return -EINVAL;
+	}
+
+	ret = gpio_request(gpio, prop);
+	if (ret)
+		pr_warn("%s: gpio %d request rc=%d, driving anyway\n",
+			__func__, gpio, ret);
+	gpio_direction_output(gpio, 0);
+	return gpio;
+}
 
 static int oppo_pa_apply(int idx, int enable)
 {
 	struct oppo_pa_gpio *pa = &oppo_pa_gpios[idx];
-	struct device_node *np;
-	int gpio, ret;
+	int g;
 
 	if (pa->gpio < 0) {
-		np = of_find_node_by_path("/soc/sound");
-		if (!np)
-			np = of_find_compatible_node(NULL, NULL,
-						"qcom,msm8952-audio-codec");
-		if (!np) {
-			pr_err("%s: no audio codec node, cannot drive %s\n",
-			       __func__, pa->prop);
-			return -ENODEV;
+		g = oppo_pa_gpio_lookup(pa->prop);
+		if (g < 0)
+			return g;
+		pa->gpio = g;
+		if (pa->boost_prop) {
+			g = oppo_pa_gpio_lookup(pa->boost_prop);
+			if (g >= 0)
+				pa->boost_gpio = g;
 		}
-		gpio = of_get_named_gpio(np, pa->prop, 0);
-		of_node_put(np);
-		if (!gpio_is_valid(gpio)) {
-			pr_err("%s: %s not found in dt\n", __func__, pa->prop);
-			return -EINVAL;
-		}
-		ret = gpio_request(gpio, pa->prop);
-		if (ret)
-			pr_warn("%s: gpio %d request rc=%d, driving anyway\n",
-				__func__, gpio, ret);
-		gpio_direction_output(gpio, 0);
-		pa->gpio = gpio;
 		pa->state = 0;
-		pr_info("%s: %s -> gpio %d\n", __func__, pa->prop, gpio);
+		pr_info("%s: %s -> gpio %d (boost gpio %d)\n", __func__,
+			pa->prop, pa->gpio, pa->boost_gpio);
 	}
 
-	if (pa->state != !!enable) {
-		gpio_set_value_cansleep(pa->gpio, !!enable);
-		pa->state = !!enable;
-		pr_info("%s: %s %s\n", __func__, pa->prop,
-			enable ? "ENABLE" : "DISABLE");
+	if (pa->state == !!enable)
+		return 0;
+
+	/*
+	 * 顺序不能反，且两步之间要留 1ms：先给功放 boost/偏置上电，稳定后
+	 * 再拉 PA 使能，否则喇叭没有输出；关闭时按相反顺序。
+	 * 与 4.9 oppo_spk_pa_enable() 的行为一致。
+	 */
+	if (enable) {
+		if (pa->boost_gpio >= 0) {
+			gpio_set_value_cansleep(pa->boost_gpio, 1);
+			usleep_range(1000, 1050);
+		}
+		gpio_set_value_cansleep(pa->gpio, 1);
+	} else {
+		gpio_set_value_cansleep(pa->gpio, 0);
+		if (pa->boost_gpio >= 0) {
+			usleep_range(1000, 1050);
+			gpio_set_value_cansleep(pa->boost_gpio, 0);
+		}
 	}
+
+	pa->state = !!enable;
+	pr_info("%s: %s %s\n", __func__, pa->prop,
+		enable ? "ENABLE" : "DISABLE");
 	return 0;
 }
 
