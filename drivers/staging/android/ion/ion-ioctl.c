@@ -222,9 +222,15 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case ION_IOC_SYNC:
 		/*
 		 * 4.9 ion_sync_for_device() pushed the cpu cache contents
-		 * of the whole dmabuf towards the device.
+		 * of the whole dmabuf towards the device. Legacy handle
+		 * based clients pass the dma-buf fd in the handle field.
 		 */
-		ret = ion_flush_buffer_fd(data.fd.fd, DMA_BIDIRECTIONAL);
+		if (data.fd.fd)
+			ret = ion_flush_buffer_fd(data.fd.fd,
+						  DMA_BIDIRECTIONAL);
+		else
+			ret = ion_flush_buffer_fd(data.fd.handle,
+						  DMA_BIDIRECTIONAL);
 		break;
 #endif
 	default:
