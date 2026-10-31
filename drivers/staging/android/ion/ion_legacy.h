@@ -4,6 +4,7 @@
 #ifdef CONFIG_ION_LEGACY
 
 #include "../uapi/ion.h"
+#include "../uapi/msm_ion.h"
 
 typedef int ion_user_handle_t;
 
@@ -105,25 +106,25 @@ struct ion_handle_data {
 #define ION_IOC_SYNC		_IOWR(ION_IOC_MAGIC, 7, struct ion_fd_data)
 
 /**
- * struct ion_fd_data_legacy - 4.9 qualcomm ion_fd_data
- * @handle:	a handle
- * @fd:		a file descriptor representing that handle
- * @offset:	unused by the vendor sync path, part of the struct ABI
- * @flags:	unused by the vendor sync path, part of the struct ABI
+ * struct ion_custom_data - 4.9 ION_IOC_CUSTOM payload
+ * @cmd:	the vendor command to run, one of the M-magic flush
+ *		ioctls (the direction is the command number and the flush
+ *		struct size is baked into the encoding)
+ * @arg:	userspace pointer to the command argument, a vendor
+ *		ion_flush_data whose first field is the dmabuf fd
  *
- * The 4.9-era vendor gralloc/memalloc builds ION_IOC_SYNC over this
- * 16-byte struct, so its command encodes as _IOWR(ION_IOC_MAGIC, 6,
- * 16) instead of the 8-byte nr 7 form.
+ * 4.9-era vendor gralloc/memalloc performs all cache maintenance
+ * through ION_IOC_CUSTOM: 64-bit clients pass a 16-byte custom_data
+ * (0xC0104906), 32-bit clients an 8-byte one (0xC0084906).
  */
-struct ion_fd_data_legacy {
-	ion_user_handle_t handle;
-	int fd;
-	unsigned int offset;
-	unsigned int flags;
+struct ion_custom_data {
+	unsigned int cmd;
+	unsigned long arg;
 };
 
-#define ION_IOC_SYNC_LEGACY	_IOWR(ION_IOC_MAGIC, 6, \
-				      struct ion_fd_data_legacy)
+#define ION_IOC_CUSTOM		_IOWR(ION_IOC_MAGIC, 6, struct ion_custom_data)
+
+int ion_legacy_cache_op(unsigned int mcmd, unsigned long uarg);
 
 #endif /* CONFIG_ION_LEGACY */
 
