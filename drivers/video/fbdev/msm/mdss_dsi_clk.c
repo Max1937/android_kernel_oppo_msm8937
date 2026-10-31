@@ -142,6 +142,8 @@ static int dsi_core_clk_stop(struct dsi_core_clks *c_clks)
 extern int mdss_dsi_pll_lpm_set_vco_rate0(unsigned long rate);
 extern unsigned long mdss_dsi_pll_lpm_get_vco_rate0(void);
 
+extern int mdss_dsi_pll_lpm_force_indirect0(unsigned long byte_rate);
+
 static int dsi_link_hs_clk_set_rate(
 	struct mdss_dsi_link_hs_clk_info *link_hs_clks)
 {
@@ -174,28 +176,23 @@ static int dsi_link_hs_clk_set_rate(
 			rc, link_hs_clks->byte_clk_rate, vco_rate);
 
 		/*
-		 * The fixed /4 byte divider rejects the request unless the cached
-		 * VCO rate matches 4x (direct) or 8x (indirect /2) the panel byte
-		 * clock. Re-program the PLL and retry before giving up.
+		 * The direct path (4x VCO) is impossible below the 350MHz PLL
+		 * floor, so panels with a ~64MHz byte clock must go through the
+		 * /2 indirect path with the VCO at exactly 8x. Reprogram the PLL
+		 * and rewire the mux, then retry the divider request.
 		 */
-		for (mult = 4; mult <= 8; mult += 4) {
-			unsigned long want =
-				(unsigned long)link_hs_clks->byte_clk_rate * mult;
-
-			if (vco_rate == want)
-				continue;
-			rc = mdss_dsi_pll_lpm_set_vco_rate0(want);
-			if (rc) {
-				pr_err("vco reprogram %dx failed rc = %d\n", mult, rc);
-				continue;
-			}
+		rc = mdss_dsi_pll_lpm_force_indirect0(
+			(unsigned long)link_hs_clks->byte_clk_rate);
+		if (rc) {
+			pr_err("indirect path recovery failed rc = %d\n", rc);
+		} else {
 			rc = clk_set_rate(link_hs_clks->byte_clk,
 				link_hs_clks->byte_clk_rate);
-			if (!rc) {
-				pr_err("byte_clk recovered via %dx VCO\n", mult);
-				break;
-			}
-			pr_err("byte_clk retry at %dx VCO rc = %d\n", mult, rc);
+			if (rc)
+				pr_err("byte_clk retry after indirect path rc = %d\n",
+					rc);
+			else
+				pr_err("byte_clk recovered via indirect path\n");
 		}
 		if (rc) {
 			pr_err("clk_set_rate for byte_clk unrecovered rc = %d\n", rc);
