@@ -787,9 +787,9 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 {
 	int ret = 0;
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct msm8916_asoc_mach_data *pdata;
+	const char *mi2s_gpio_prop = NULL;
+	struct device_node *np_mi2s;
 	int port_id = 0;
-	int mi2s_idx = -1;
 
 	port_id = msm8952_get_port_id(rtd->dai_link->id);
 	if (port_id < 0) {
@@ -803,30 +803,38 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 	 * (MUX UNCLAIMED), so the PRI/QUAT MI2S bit clock and data
 	 * never reach the internal codec and playback is silent.
 	 */
-	pdata = snd_soc_card_get_drvdata(rtd->card);
 	switch (port_id) {
 	case AFE_PORT_ID_PRIMARY_MI2S_RX:
-		mi2s_idx = PRIM_MI2S;
+		mi2s_gpio_prop = "qcom,pri-mi2s-gpios";
 		break;
 	case AFE_PORT_ID_SECONDARY_MI2S_RX:
-		mi2s_idx = SEC_MI2S;
+		mi2s_gpio_prop = "qcom,sec-mi2s-gpios";
 		break;
 	case AFE_PORT_ID_TERTIARY_MI2S_RX:
-		mi2s_idx = TERT_MI2S;
+		mi2s_gpio_prop = "qcom,tert-mi2s-gpios";
 		break;
 	case AFE_PORT_ID_QUATERNARY_MI2S_RX:
-		mi2s_idx = QUAT_MI2S;
+		mi2s_gpio_prop = "qcom,quat-mi2s-gpios";
 		break;
 	case AFE_PORT_ID_QUINARY_MI2S_RX:
-		mi2s_idx = QUIN_MI2S;
+		mi2s_gpio_prop = "qcom,quin-mi2s-gpios";
 		break;
 	default:
 		break;
 	}
 	if (enable) {
-		if (mi2s_idx >= 0 && pdata->mi2s_gpio_p[mi2s_idx])
-			msm_cdc_pinctrl_select_active_state(
-					pdata->mi2s_gpio_p[mi2s_idx]);
+		if (mi2s_gpio_prop) {
+			np_mi2s = of_parse_phandle(rtd->dev->of_node,
+					     mi2s_gpio_prop, 0);
+			if (np_mi2s) {
+				ret = msm_cdc_pinctrl_select_active_state(
+							 np_mi2s);
+				if (ret)
+					pr_err("%s: %s active failed %d\n",
+					       __func__, mi2s_gpio_prop, ret);
+				of_node_put(np_mi2s);
+			}
+		}
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 			mi2s_rx_clk.enable = enable;
 			mi2s_rx_clk.clk_id =
@@ -869,9 +877,18 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 		if (ret < 0)
 			pr_err("%s:afe_set_lpass_clock_v2 failed\n", __func__);
 	}
-	if (!enable && mi2s_idx >= 0 && pdata->mi2s_gpio_p[mi2s_idx])
-		msm_cdc_pinctrl_select_sleep_state(
-				pdata->mi2s_gpio_p[mi2s_idx]);
+	if (!enable && mi2s_gpio_prop) {
+		np_mi2s = of_parse_phandle(rtd->dev->of_node,
+					   mi2s_gpio_prop, 0);
+		if (np_mi2s) {
+			ret = msm_cdc_pinctrl_select_sleep_state(
+						 np_mi2s);
+			if (ret)
+				pr_err("%s: %s sleep failed %d\n",
+					       __func__, mi2s_gpio_prop, ret);
+			of_node_put(np_mi2s);
+		}
+	}
 	return ret;
 }
 
