@@ -1,2624 +1,1 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-#include <linux/mutex.h>
-#include <linux/io.h>
-#include <media/v4l2-subdev.h>
-#include <linux/ratelimit.h>
-
-#include "msm.h"
-#include "msm_isp_util.h"
-#include "msm_isp_axi_util.h"
-#include "msm_isp_stats_util.h"
-#include "msm_camera_io_util.h"
-#include "cam_smmu_api.h"
-#include "msm_isp48.h"
-
-#ifndef UINT16_MAX
-#define UINT16_MAX             (65535U)
-#endif
-
-#define MAX_ISP_V4l2_EVENTS 100
-#define MAX_ISP_REG_LIST 100
-static DEFINE_MUTEX(bandwidth_mgr_mutex);
-static struct msm_isp_bandwidth_mgr isp_bandwidth_mgr;
-
-#define MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev) { \
-	if (vfe_dev->is_split && vfe_dev->pdev->id == ISP_VFE0) { \
-		struct vfe_device *vfe1_dev = vfe_dev->common_data-> \
-					dual_vfe_res->vfe_dev[ISP_VFE1]; \
-		mutex_lock(&vfe1_dev->core_mutex); \
-	} \
-}
-
-#define MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev) { \
-	if (vfe_dev->is_split && vfe_dev->pdev->id == ISP_VFE0) { \
-		struct vfe_device *vfe1_dev = vfe_dev->common_data-> \
-					dual_vfe_res->vfe_dev[ISP_VFE1]; \
-		mutex_unlock(&vfe1_dev->core_mutex); \
-	} \
-}
-
-static uint64_t msm_isp_cpp_clk_rate;
-
-#define VFE40_8974V2_VERSION 0x1001001A
-
-void msm_isp_print_fourcc_error(const char *origin, uint32_t fourcc_format)
-{
-	int i;
-	char text[5];
-
-	text[4] = '\0';
-	for (i = 0; i < 4; i++) {
-		text[i] = (char)(((fourcc_format) >> (i * 8)) & 0xFF);
-		if ((text[i] < '0') || (text[i] > 'z')) {
-			pr_err("%s: Invalid output format %d (unprintable)\n",
-				origin, fourcc_format);
-			return;
-		}
-	}
-	pr_err("%s: Invalid output format %s\n",
-		origin, text);
-}
-
-int msm_isp_init_bandwidth_mgr(struct vfe_device *vfe_dev,
-			enum msm_isp_hw_client client)
-{
-	int rc = 0;
-
-	mutex_lock(&bandwidth_mgr_mutex);
-	if (isp_bandwidth_mgr.client_info[client].active) {
-		mutex_unlock(&bandwidth_mgr_mutex);
-		return rc;
-	}
-	isp_bandwidth_mgr.client_info[client].active = 1;
-	isp_bandwidth_mgr.use_count++;
-	if (vfe_dev && !isp_bandwidth_mgr.bus_client) {
-		rc = vfe_dev->hw_info->vfe_ops.platform_ops.init_bw_mgr(vfe_dev,
-				&isp_bandwidth_mgr);
-		if (!rc) {
-			isp_bandwidth_mgr.update_bw =
-			vfe_dev->hw_info->vfe_ops.platform_ops.update_bw;
-			isp_bandwidth_mgr.deinit_bw_mgr =
-			vfe_dev->hw_info->vfe_ops.platform_ops.deinit_bw_mgr;
-		}
-	}
-	if (rc) {
-		isp_bandwidth_mgr.use_count--;
-		isp_bandwidth_mgr.client_info[client].active = 0;
-	}
-
-	mutex_unlock(&bandwidth_mgr_mutex);
-	return rc;
-}
-
-int msm_isp_update_bandwidth(enum msm_isp_hw_client client,
-	uint64_t ab, uint64_t ib)
-{
-	int rc;
-
-	mutex_lock(&bandwidth_mgr_mutex);
-	if (!isp_bandwidth_mgr.use_count ||
-		!isp_bandwidth_mgr.bus_client) {
-		pr_err("%s:error bandwidth manager inactive use_cnt:%d bus_clnt:%d\n",
-			__func__, isp_bandwidth_mgr.use_count,
-			isp_bandwidth_mgr.bus_client);
-		mutex_unlock(&bandwidth_mgr_mutex);
-		return -EINVAL;
-	}
-
-	isp_bandwidth_mgr.client_info[client].ab = ab;
-	isp_bandwidth_mgr.client_info[client].ib = ib;
-	rc = isp_bandwidth_mgr.update_bw(&isp_bandwidth_mgr);
-	mutex_unlock(&bandwidth_mgr_mutex);
-	return 0;
-}
-
-void msm_isp_deinit_bandwidth_mgr(enum msm_isp_hw_client client)
-{
-	if (client >= MAX_ISP_CLIENT) {
-		pr_err("invalid Client id %d\n", client);
-		return;
-	}
-	mutex_lock(&bandwidth_mgr_mutex);
-	memset(&isp_bandwidth_mgr.client_info[client], 0,
-			sizeof(struct msm_isp_bandwidth_info));
-	if (isp_bandwidth_mgr.use_count) {
-		isp_bandwidth_mgr.use_count--;
-		if (isp_bandwidth_mgr.use_count) {
-			mutex_unlock(&bandwidth_mgr_mutex);
-			return;
-		}
-
-		if (!isp_bandwidth_mgr.bus_client) {
-			pr_err("%s:%d error: bus client invalid\n",
-				__func__, __LINE__);
-			mutex_unlock(&bandwidth_mgr_mutex);
-			return;
-		}
-
-		isp_bandwidth_mgr.deinit_bw_mgr(
-				&isp_bandwidth_mgr);
-	}
-	mutex_unlock(&bandwidth_mgr_mutex);
-}
-
-void msm_isp_util_get_bandwidth_stats(struct vfe_device *vfe_dev,
-				      struct msm_isp_statistics *stats)
-{
-	stats->isp_vfe0_active = isp_bandwidth_mgr.client_info[ISP_VFE0].active;
-	stats->isp_vfe0_ab = isp_bandwidth_mgr.client_info[ISP_VFE0].ab;
-	stats->isp_vfe0_ib = isp_bandwidth_mgr.client_info[ISP_VFE0].ib;
-
-	stats->isp_vfe1_active = isp_bandwidth_mgr.client_info[ISP_VFE1].active;
-	stats->isp_vfe1_ab = isp_bandwidth_mgr.client_info[ISP_VFE1].ab;
-	stats->isp_vfe1_ib = isp_bandwidth_mgr.client_info[ISP_VFE1].ib;
-
-	stats->isp_cpp_active = isp_bandwidth_mgr.client_info[ISP_CPP].active;
-	stats->isp_cpp_ab = isp_bandwidth_mgr.client_info[ISP_CPP].ab;
-	stats->isp_cpp_ib = isp_bandwidth_mgr.client_info[ISP_CPP].ib;
-	stats->last_overflow_ab = vfe_dev->msm_isp_last_overflow_ab;
-	stats->last_overflow_ib = vfe_dev->msm_isp_last_overflow_ib;
-	stats->vfe_clk_rate = vfe_dev->vfe_clk_info[
-				vfe_dev->hw_info->vfe_clk_idx].clk_rate;
-	stats->cpp_clk_rate = msm_isp_cpp_clk_rate;
-}
-
-void msm_isp_util_update_clk_rate(long clock_rate)
-{
-	msm_isp_cpp_clk_rate = clock_rate;
-}
-
-uint32_t msm_isp_get_framedrop_period(
-	enum msm_vfe_frame_skip_pattern frame_skip_pattern)
-{
-	switch (frame_skip_pattern) {
-	case NO_SKIP:
-	case EVERY_2FRAME:
-	case EVERY_3FRAME:
-	case EVERY_4FRAME:
-	case EVERY_5FRAME:
-	case EVERY_6FRAME:
-	case EVERY_7FRAME:
-	case EVERY_8FRAME:
-		return frame_skip_pattern + 1;
-	case EVERY_16FRAME:
-		return 16;
-	case EVERY_32FRAME:
-		return 32;
-	case SKIP_ALL:
-		return SKIP_ALL;
-	default:
-		return 1;
-	}
-	return 1;
-}
-
-void msm_isp_get_timestamp(struct msm_isp_timestamp *time_stamp,
-	struct vfe_device *vfe_dev)
-{
-	struct timespec ts;
-
-	do_gettimeofday(&(time_stamp->event_time));
-	if (vfe_dev->vt_enable) {
-		msm_isp_get_avtimer_ts(time_stamp);
-		time_stamp->buf_time.tv_sec    = time_stamp->vt_time.tv_sec;
-		time_stamp->buf_time.tv_usec   = time_stamp->vt_time.tv_usec;
-	} else {
-		get_monotonic_boottime(&ts);
-		time_stamp->buf_time.tv_sec    = ts.tv_sec;
-		time_stamp->buf_time.tv_usec   = ts.tv_nsec/1000;
-		time_stamp->buf_time_ns        =
-			((uint64_t)ts.tv_sec * 1000000000) + ts.tv_nsec;
-	}
-}
-
-static inline u32 msm_isp_evt_mask_to_isp_event(u32 evt_mask)
-{
-	u32 evt_id = ISP_EVENT_SUBS_MASK_NONE;
-
-	switch (evt_mask) {
-	case ISP_EVENT_MASK_INDEX_STATS_NOTIFY:
-		evt_id = ISP_EVENT_STATS_NOTIFY;
-		break;
-	case ISP_EVENT_MASK_INDEX_ERROR:
-		evt_id = ISP_EVENT_ERROR;
-		break;
-	case ISP_EVENT_MASK_INDEX_IOMMU_P_FAULT:
-		evt_id = ISP_EVENT_IOMMU_P_FAULT;
-		break;
-	case ISP_EVENT_MASK_INDEX_STREAM_UPDATE_DONE:
-		evt_id = ISP_EVENT_STREAM_UPDATE_DONE;
-		break;
-	case ISP_EVENT_MASK_INDEX_REG_UPDATE:
-		evt_id = ISP_EVENT_REG_UPDATE;
-		break;
-	case ISP_EVENT_MASK_INDEX_SOF:
-		evt_id = ISP_EVENT_SOF;
-		break;
-	case ISP_EVENT_MASK_INDEX_BUF_DIVERT:
-		evt_id = ISP_EVENT_BUF_DIVERT;
-		break;
-	case ISP_EVENT_MASK_INDEX_BUF_DONE:
-		evt_id = ISP_EVENT_BUF_DONE;
-		break;
-	case ISP_EVENT_MASK_INDEX_COMP_STATS_NOTIFY:
-		evt_id = ISP_EVENT_COMP_STATS_NOTIFY;
-		break;
-	case ISP_EVENT_MASK_INDEX_MASK_FE_READ_DONE:
-		evt_id = ISP_EVENT_FE_READ_DONE;
-		break;
-	case ISP_EVENT_MASK_INDEX_PING_PONG_MISMATCH:
-		evt_id = ISP_EVENT_PING_PONG_MISMATCH;
-		break;
-	case ISP_EVENT_MASK_INDEX_REG_UPDATE_MISSING:
-		evt_id = ISP_EVENT_REG_UPDATE_MISSING;
-		break;
-	case ISP_EVENT_MASK_INDEX_BUF_FATAL_ERROR:
-		evt_id = ISP_EVENT_BUF_FATAL_ERROR;
-		break;
-	case ISP_EVENT_MASK_INDEX_SOF_UPDATE_NANOSEC:
-		evt_id = ISP_EVENT_SOF_UPDATE_NANOSEC;
-		break;
-	default:
-		evt_id = ISP_EVENT_SUBS_MASK_NONE;
-		break;
-	}
-
-	return evt_id;
-}
-
-static inline int msm_isp_subscribe_event_mask(struct v4l2_fh *fh,
-		struct v4l2_event_subscription *sub, int evt_mask_index,
-		u32 evt_id, bool subscribe_flag)
-{
-	int rc = 0, i, interface;
-
-	if (evt_mask_index == ISP_EVENT_MASK_INDEX_STATS_NOTIFY) {
-		for (i = 0; i < MSM_ISP_STATS_MAX; i++) {
-			sub->type = evt_id + i;
-			if (subscribe_flag)
-				rc = v4l2_event_subscribe(fh, sub,
-					MAX_ISP_V4l2_EVENTS, NULL);
-			else
-				rc = v4l2_event_unsubscribe(fh, sub);
-			if (rc != 0) {
-				pr_err("%s: Subs event_type =0x%x failed\n",
-					__func__, sub->type);
-				return rc;
-			}
-		}
-	} else if (evt_mask_index == ISP_EVENT_MASK_INDEX_SOF ||
-		   evt_mask_index == ISP_EVENT_MASK_INDEX_SOF_UPDATE_NANOSEC ||
-		   evt_mask_index == ISP_EVENT_MASK_INDEX_REG_UPDATE ||
-		   evt_mask_index == ISP_EVENT_MASK_INDEX_STREAM_UPDATE_DONE) {
-		for (interface = 0; interface < VFE_SRC_MAX; interface++) {
-			sub->type = evt_id | interface;
-			if (subscribe_flag)
-				rc = v4l2_event_subscribe(fh, sub,
-					MAX_ISP_V4l2_EVENTS, NULL);
-			else
-				rc = v4l2_event_unsubscribe(fh, sub);
-			if (rc != 0) {
-				pr_err("%s: Subs event_type =0x%x failed\n",
-					__func__, sub->type);
-				return rc;
-			}
-		}
-	} else {
-		sub->type = evt_id;
-		if (subscribe_flag)
-			rc = v4l2_event_subscribe(fh, sub,
-				MAX_ISP_V4l2_EVENTS, NULL);
-		else
-			rc = v4l2_event_unsubscribe(fh, sub);
-		if (rc != 0) {
-			pr_err("%s: Subs event_type =0x%x failed\n",
-				__func__, sub->type);
-			return rc;
-		}
-	}
-	return rc;
-}
-
-static inline int msm_isp_process_event_subscription(struct v4l2_fh *fh,
-	struct v4l2_event_subscription *sub, bool subscribe_flag)
-{
-	int rc = 0, evt_mask_index = 0;
-	u32 evt_mask = sub->type;
-	u32 evt_id = 0;
-
-	if (evt_mask == ISP_EVENT_SUBS_MASK_NONE) {
-		pr_err("%s: Subs event_type is None=0x%x\n",
-			__func__, evt_mask);
-		return 0;
-	}
-
-	for (evt_mask_index = ISP_EVENT_MASK_INDEX_STATS_NOTIFY;
-		evt_mask_index <= ISP_EVENT_MASK_INDEX_SOF_UPDATE_NANOSEC;
-		evt_mask_index++) {
-		if (evt_mask & (1<<evt_mask_index)) {
-			evt_id = msm_isp_evt_mask_to_isp_event(evt_mask_index);
-			rc = msm_isp_subscribe_event_mask(fh, sub,
-				evt_mask_index, evt_id, subscribe_flag);
-			if (rc != 0) {
-				pr_err("%s: Subs event index:%d failed\n",
-					__func__, evt_mask_index);
-				return rc;
-			}
-		}
-	}
-	return rc;
-}
-
-int msm_isp_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
-	struct v4l2_event_subscription *sub)
-{
-	return msm_isp_process_event_subscription(fh, sub, true);
-}
-
-int msm_isp_unsubscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
-	struct v4l2_event_subscription *sub)
-{
-	return msm_isp_process_event_subscription(fh, sub, false);
-}
-
-static int msm_isp_start_fetch_engine(struct vfe_device *vfe_dev,
-	void *arg)
-{
-	struct msm_vfe_fetch_eng_start *fe_cfg = arg;
-	/*
-	 * For Offline VFE, HAL expects same frame id
-	 * for offline output which it requested in do_reprocess.
-	 */
-	vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id =
-		fe_cfg->frame_id;
-	return vfe_dev->hw_info->vfe_ops.core_ops.start_fetch_eng(vfe_dev,
-			arg);
-}
-
-static int msm_isp_start_fetch_engine_multi_pass(struct vfe_device *vfe_dev,
-	void *arg)
-{
-	struct msm_vfe_fetch_eng_multi_pass_start *fe_cfg = arg;
-	struct msm_vfe_axi_stream *stream_info = NULL;
-	int i = 0, rc;
-	uint32_t wm_reload_mask = 0;
-	int vfe_idx;
-	/*
-	 * For Offline VFE, HAL expects same frame id
-	 * for offline output which it requested in do_reprocess.
-	 */
-	vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id =
-		fe_cfg->frame_id;
-	if (fe_cfg->offline_pass == OFFLINE_SECOND_PASS) {
-		stream_info = msm_isp_get_stream_common_data(vfe_dev,
-			HANDLE_TO_IDX(fe_cfg->output_stream_id));
-		if (stream_info == NULL) {
-			pr_err("%s: Error in Offline process\n", __func__);
-			return -EINVAL;
-		}
-		vfe_idx = msm_isp_get_vfe_idx_for_stream(vfe_dev, stream_info);
-		msm_isp_reset_framedrop(vfe_dev, stream_info);
-
-		mutex_lock(&vfe_dev->buf_mgr->lock);
-		rc = msm_isp_cfg_offline_ping_pong_address(vfe_dev, stream_info,
-			VFE_PING_FLAG, fe_cfg->output_buf_idx);
-		mutex_unlock(&vfe_dev->buf_mgr->lock);
-		if (rc < 0) {
-			pr_err("%s: Fetch engine config failed\n", __func__);
-			return -EINVAL;
-		}
-		for (i = 0; i < stream_info->num_planes; i++) {
-			vfe_dev->hw_info->vfe_ops.axi_ops.enable_wm(
-				vfe_dev->vfe_base,
-				stream_info->wm[vfe_idx][i], 1);
-			wm_reload_mask |= (1 << stream_info->wm[vfe_idx][i]);
-		}
-		vfe_dev->hw_info->vfe_ops.core_ops.reg_update(vfe_dev,
-			VFE_SRC_MAX);
-		vfe_dev->hw_info->vfe_ops.axi_ops.reload_wm(vfe_dev,
-			vfe_dev->vfe_base, wm_reload_mask);
-	}
-	return vfe_dev->hw_info->vfe_ops.core_ops.start_fetch_eng_multi_pass(
-			vfe_dev, arg);
-}
-
-void msm_isp_fetch_engine_done_notify(struct vfe_device *vfe_dev,
-	struct msm_vfe_fetch_engine_info *fetch_engine_info)
-{
-	struct msm_isp_event_data fe_rd_done_event;
-
-	memset(&fe_rd_done_event, 0, sizeof(struct msm_isp_event_data));
-	fe_rd_done_event.frame_id =
-		vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id;
-	fe_rd_done_event.u.fetch_done.session_id =
-		fetch_engine_info->session_id;
-	fe_rd_done_event.u.fetch_done.stream_id = fetch_engine_info->stream_id;
-	fe_rd_done_event.u.fetch_done.handle = fetch_engine_info->bufq_handle;
-	fe_rd_done_event.u.fetch_done.buf_idx = fetch_engine_info->buf_idx;
-	fe_rd_done_event.u.fetch_done.fd = fetch_engine_info->fd;
-	fe_rd_done_event.u.fetch_done.offline_mode =
-		fetch_engine_info->offline_mode;
-
-	ISP_DBG("%s:VFE%d ISP_EVENT_FE_READ_DONE buf_idx %d\n",
-		__func__, vfe_dev->pdev->id, fetch_engine_info->buf_idx);
-	fetch_engine_info->is_busy = 0;
-	msm_isp_send_event(vfe_dev, ISP_EVENT_FE_READ_DONE, &fe_rd_done_event);
-}
-
-static int msm_isp_cfg_pix(struct vfe_device *vfe_dev,
-	struct msm_vfe_input_cfg *input_cfg)
-{
-	int rc = 0;
-	struct msm_vfe_pix_cfg *pix_cfg = NULL;
-
-	if (vfe_dev->axi_data.src_info[VFE_PIX_0].active) {
-		pr_err("%s: src %d path is active\n", __func__, VFE_PIX_0);
-		return -EINVAL;
-	}
-
-	pix_cfg = &input_cfg->d.pix_cfg;
-	vfe_dev->hvx_cmd = pix_cfg->hvx_cmd;
-	vfe_dev->is_split = input_cfg->d.pix_cfg.is_split;
-
-	vfe_dev->axi_data.src_info[VFE_PIX_0].pixel_clock =
-		input_cfg->input_pix_clk;
-	vfe_dev->axi_data.src_info[VFE_PIX_0].input_mux =
-		input_cfg->d.pix_cfg.input_mux;
-	vfe_dev->axi_data.src_info[VFE_PIX_0].input_format =
-		input_cfg->d.pix_cfg.input_format;
-	vfe_dev->axi_data.src_info[VFE_PIX_0].sof_counter_step = 1;
-
-	/*
-	 * Fill pixel_clock into input_pix_clk so that user space
-	 * can use rounded clk rate
-	 */
-	input_cfg->input_pix_clk =
-		vfe_dev->axi_data.src_info[VFE_PIX_0].pixel_clock;
-
-	ISP_DBG("%s: input mux is %d CAMIF %d io_format 0x%x\n", __func__,
-		input_cfg->d.pix_cfg.input_mux, CAMIF,
-		input_cfg->d.pix_cfg.input_format);
-
-	if (input_cfg->d.pix_cfg.input_mux == CAMIF ||
-		input_cfg->d.pix_cfg.input_mux == TESTGEN) {
-		if (input_cfg->d.pix_cfg.input_mux == CAMIF)
-			vfe_dev->axi_data.src_info[VFE_PIX_0].width =
-				input_cfg->d.pix_cfg.camif_cfg.pixels_per_line;
-		if (input_cfg->d.pix_cfg.input_mux == TESTGEN)
-			vfe_dev->axi_data.src_info[VFE_PIX_0].width =
-			input_cfg->d.pix_cfg.testgen_cfg.pixels_per_line;
-		if (input_cfg->d.pix_cfg.camif_cfg.subsample_cfg
-			.sof_counter_step > 0) {
-			vfe_dev->axi_data.src_info[
-			VFE_PIX_0].sof_counter_step =
-			input_cfg->d.pix_cfg.camif_cfg.subsample_cfg
-				.sof_counter_step;
-		}
-	} else if (input_cfg->d.pix_cfg.input_mux == EXTERNAL_READ) {
-		vfe_dev->axi_data.src_info[VFE_PIX_0].width =
-			input_cfg->d.pix_cfg.fetch_engine_cfg.buf_stride;
-	}
-	vfe_dev->hw_info->vfe_ops.core_ops.cfg_input_mux(
-			vfe_dev, &input_cfg->d.pix_cfg);
-	vfe_dev->hw_info->vfe_ops.core_ops.reg_update(vfe_dev, VFE_PIX_0);
-	return rc;
-}
-
-static int msm_isp_cfg_rdi(struct vfe_device *vfe_dev,
-	struct msm_vfe_input_cfg *input_cfg)
-{
-	int rc = 0;
-
-	if (vfe_dev->axi_data.src_info[input_cfg->input_src].active) {
-		pr_err("%s: RAW%d path is active\n", __func__,
-			   input_cfg->input_src - VFE_RAW_0);
-		return -EINVAL;
-	}
-
-	vfe_dev->axi_data.src_info[input_cfg->input_src].sof_counter_step = 1;
-
-	vfe_dev->axi_data.src_info[input_cfg->input_src].pixel_clock =
-		input_cfg->input_pix_clk;
-	vfe_dev->hw_info->vfe_ops.core_ops.cfg_rdi_reg(
-		vfe_dev, &input_cfg->d.rdi_cfg, input_cfg->input_src);
-	return rc;
-}
-static int msm_isp_set_dual_vfe_sync_mode(
-	struct vfe_device *vfe_dev, void *arg)
-{
-	struct msm_vfe_dual_vfe_sync_mode *mode = arg;
-
-	vfe_dev->dual_vfe_sync_enable = mode->enable;
-	return 0;
-}
-static int msm_isp_nano_sec_timestamp(
-	struct vfe_device *vfe_dev, void *arg)
-{
-	struct msm_vfe_nano_sec_timestamp *mode = arg;
-
-	vfe_dev->nanosec_ts_enable = mode->enable;
-	return 0;
-}
-int msm_isp_cfg_input(struct vfe_device *vfe_dev, void *arg)
-{
-	int rc = 0;
-	struct msm_vfe_input_cfg *input_cfg = arg;
-	long pixel_clock = 0;
-
-	switch (input_cfg->input_src) {
-	case VFE_PIX_0:
-		rc = msm_isp_cfg_pix(vfe_dev, input_cfg);
-		break;
-	case VFE_RAW_0:
-	case VFE_RAW_1:
-	case VFE_RAW_2:
-		rc = msm_isp_cfg_rdi(vfe_dev, input_cfg);
-		break;
-	default:
-		pr_err("%s: Invalid input source\n", __func__);
-		rc = -EINVAL;
-	}
-
-	pixel_clock = input_cfg->input_pix_clk;
-	/*
-	 * Only set rate to higher, do not lower higher
-	 * rate needed by another input
-	 */
-	if (pixel_clock > vfe_dev->vfe_clk_info[
-				vfe_dev->hw_info->vfe_clk_idx].clk_rate) {
-		rc = vfe_dev->hw_info->vfe_ops.platform_ops.set_clk_rate(
-			vfe_dev,
-			&pixel_clock);
-		if (rc < 0) {
-			pr_err("%s: clock set rate failed\n", __func__);
-			return rc;
-		}
-	}
-	return rc;
-}
-
-static int msm_isp_dual_hw_master_slave_sync(struct vfe_device *vfe_dev,
-						void *arg)
-{
-	int rc = 0;
-
-	struct msm_isp_dual_hw_master_slave_sync *link = arg;
-	unsigned long flags;
-	struct master_slave_resource_info *ms_res =
-			&vfe_dev->common_data->ms_resource;
-	int i;
-	struct msm_vfe_src_info *src_info = NULL;
-
-	spin_lock_irqsave(
-			&vfe_dev->common_data->common_dev_data_lock,
-			flags);
-	ms_res->dual_sync_mode = link->sync_mode;
-	if (ms_res->dual_sync_mode == MSM_ISP_DUAL_CAM_ASYNC) {
-		for (i = 0; i < MAX_VFE * VFE_SRC_MAX; i++) {
-			if (ms_res->src_info[i] == NULL)
-				continue;
-			src_info = ms_res->src_info[i];
-			if (src_info->dual_hw_ms_info.sync_state ==
-				MSM_ISP_DUAL_CAM_ASYNC)
-				continue;
-			ms_res->active_src_mask &= ~(1 <<
-				src_info->dual_hw_ms_info.index);
-			ms_res->src_sof_mask &= ~(1 <<
-				src_info->dual_hw_ms_info.index);
-			src_info->dual_hw_ms_info.sync_state =
-				MSM_ISP_DUAL_CAM_ASYNC;
-		}
-	}
-	spin_unlock_irqrestore(
-			&vfe_dev->common_data->common_dev_data_lock,
-			flags);
-	return rc;
-}
-
-static int msm_isp_set_dual_HW_master_slave_mode(
-	struct vfe_device *vfe_dev, void *arg)
-{
-	int rc = 0, i;
-	struct msm_isp_set_dual_hw_ms_cmd *dual_hw_ms_cmd = NULL;
-	struct msm_vfe_src_info *src_info = NULL;
-	unsigned long flags;
-	struct master_slave_resource_info *ms_res =
-			&vfe_dev->common_data->ms_resource;
-
-	if (!vfe_dev || !arg) {
-		pr_err("%s: Error! Invalid input vfe_dev %pK arg %pK\n",
-			__func__, vfe_dev, arg);
-		return -EINVAL;
-	}
-
-	spin_lock_irqsave(&vfe_dev->common_data->common_dev_data_lock, flags);
-	dual_hw_ms_cmd = (struct msm_isp_set_dual_hw_ms_cmd *)arg;
-	vfe_dev->common_data->ms_resource.dual_hw_type = DUAL_HW_MASTER_SLAVE;
-	vfe_dev->vfe_ub_policy = MSM_WM_UB_EQUAL_SLICING;
-	if (dual_hw_ms_cmd->primary_intf < VFE_SRC_MAX) {
-		ISP_DBG("%s: vfe %d primary_intf %d\n", __func__,
-			vfe_dev->pdev->id, dual_hw_ms_cmd->primary_intf);
-		src_info = &vfe_dev->axi_data.src_info[
-				dual_hw_ms_cmd->primary_intf];
-		src_info->dual_hw_type = DUAL_HW_MASTER_SLAVE;
-		src_info->dual_hw_ms_info.dual_hw_ms_type =
-			dual_hw_ms_cmd->dual_hw_ms_type;
-		src_info->dual_hw_ms_info.index = dual_hw_ms_cmd->primary_intf
-			+ VFE_SRC_MAX * vfe_dev->pdev->id;
-		ms_res->src_info[src_info->dual_hw_ms_info.index] = src_info;
-		ms_res->num_src++;
-		if (dual_hw_ms_cmd->dual_hw_ms_type == MS_TYPE_MASTER) {
-			ms_res->master_index = src_info->dual_hw_ms_info.index;
-			ms_res->sof_delta_threshold =
-				dual_hw_ms_cmd->sof_delta_threshold;
-		} else {
-			ms_res->primary_slv_idx =
-				src_info->dual_hw_ms_info.index;
-		}
-	}
-	ISP_DBG("%s: vfe %d num_src %d\n", __func__, vfe_dev->pdev->id,
-		dual_hw_ms_cmd->num_src);
-	if (dual_hw_ms_cmd->num_src > VFE_SRC_MAX) {
-		pr_err("%s: Error! Invalid num_src %d\n", __func__,
-			dual_hw_ms_cmd->num_src);
-		spin_unlock_irqrestore(
-			&vfe_dev->common_data->common_dev_data_lock, flags);
-		return -EINVAL;
-	}
-	/* This for loop is for non-primary intf to be marked with Master/Slave
-	 * in order for frame id sync. But their timestamp is not saved.
-	 * So no sof_info resource is allocated
-	 */
-	for (i = 0; i < dual_hw_ms_cmd->num_src; i++) {
-		if (dual_hw_ms_cmd->input_src[i] >= VFE_SRC_MAX) {
-			pr_err("%s: Error! Invalid SRC param %d\n", __func__,
-				dual_hw_ms_cmd->input_src[i]);
-			spin_unlock_irqrestore(
-				&vfe_dev->common_data->common_dev_data_lock,
-				flags);
-			return -EINVAL;
-		}
-		ISP_DBG("%s: vfe %d src %d type %d\n", __func__,
-			vfe_dev->pdev->id, dual_hw_ms_cmd->input_src[i],
-			dual_hw_ms_cmd->dual_hw_ms_type);
-		src_info = &vfe_dev->axi_data.src_info[
-				dual_hw_ms_cmd->input_src[i]];
-		src_info->dual_hw_type = DUAL_HW_MASTER_SLAVE;
-		src_info->dual_hw_ms_info.dual_hw_ms_type =
-			dual_hw_ms_cmd->dual_hw_ms_type;
-		src_info->dual_hw_ms_info.index = dual_hw_ms_cmd->input_src[i]
-				+ VFE_SRC_MAX * vfe_dev->pdev->id;
-		ms_res->src_info[src_info->dual_hw_ms_info.index] = src_info;
-		ms_res->num_src++;
-	}
-	spin_unlock_irqrestore(&vfe_dev->common_data->common_dev_data_lock,
-				flags);
-	return rc;
-}
-
-static int msm_isp_proc_cmd_list_unlocked(struct vfe_device *vfe_dev, void *arg)
-{
-	int rc = 0;
-	uint32_t count = 0;
-	struct msm_vfe_cfg_cmd_list *proc_cmd =
-		(struct msm_vfe_cfg_cmd_list *)arg;
-	struct msm_vfe_cfg_cmd_list cmd, cmd_next;
-
-	if (!vfe_dev || !arg) {
-		pr_err("%s:%d failed: vfe_dev %pK arg %pK\n",
-			__func__, __LINE__, vfe_dev, arg);
-		return -EINVAL;
-	}
-
-	rc = msm_isp_proc_cmd(vfe_dev, &proc_cmd->cfg_cmd);
-	if (rc < 0)
-		pr_err("%s:%d failed: rc %d\n", __func__, __LINE__, rc);
-
-	cmd = *proc_cmd;
-
-	while (cmd.next) {
-		if (cmd.next_size != sizeof(struct msm_vfe_cfg_cmd_list)) {
-			pr_err("%s:%d failed: next size %u != expected %zu\n",
-				__func__, __LINE__, cmd.next_size,
-				sizeof(struct msm_vfe_cfg_cmd_list));
-			break;
-		}
-		if (++count >= MAX_ISP_REG_LIST) {
-			pr_err("%s:%d Error exceeding the max register count:%u\n",
-				__func__, __LINE__, count);
-			rc = -EINVAL;
-			break;
-		}
-		if (copy_from_user(&cmd_next, (void __user *)cmd.next,
-			sizeof(struct msm_vfe_cfg_cmd_list))) {
-			rc = -EFAULT;
-			continue;
-		}
-
-		rc = msm_isp_proc_cmd(vfe_dev, &cmd_next.cfg_cmd);
-		if (rc < 0)
-			pr_err("%s:%d failed: rc %d\n", __func__, __LINE__, rc);
-
-		cmd = cmd_next;
-	}
-	return rc;
-}
-
-#ifdef CONFIG_COMPAT
-struct msm_vfe_cfg_cmd2_32 {
-	uint16_t num_cfg;
-	uint16_t cmd_len;
-	compat_caddr_t cfg_data;
-	compat_caddr_t cfg_cmd;
-};
-
-struct msm_vfe_cfg_cmd_list_32 {
-	struct msm_vfe_cfg_cmd2_32   cfg_cmd;
-	compat_caddr_t               next;
-	uint32_t                     next_size;
-};
-
-#define VIDIOC_MSM_VFE_REG_CFG_COMPAT \
-	_IOWR('V', BASE_VIDIOC_PRIVATE, struct msm_vfe_cfg_cmd2_32)
-#define VIDIOC_MSM_VFE_REG_LIST_CFG_COMPAT \
-	_IOWR('V', BASE_VIDIOC_PRIVATE+14, struct msm_vfe_cfg_cmd_list_32)
-
-static void msm_isp_compat_to_proc_cmd(struct msm_vfe_cfg_cmd2 *proc_cmd,
-	struct msm_vfe_cfg_cmd2_32 *proc_cmd_ptr32)
-{
-	proc_cmd->num_cfg = proc_cmd_ptr32->num_cfg;
-	proc_cmd->cmd_len = proc_cmd_ptr32->cmd_len;
-	proc_cmd->cfg_data = compat_ptr(proc_cmd_ptr32->cfg_data);
-	proc_cmd->cfg_cmd = compat_ptr(proc_cmd_ptr32->cfg_cmd);
-}
-
-static int msm_isp_proc_cmd_list_compat(struct vfe_device *vfe_dev, void *arg)
-{
-	int rc = 0;
-	uint32_t count = 0;
-	struct msm_vfe_cfg_cmd_list_32 *proc_cmd =
-		(struct msm_vfe_cfg_cmd_list_32 *)arg;
-	struct msm_vfe_cfg_cmd_list_32 cmd, cmd_next;
-	struct msm_vfe_cfg_cmd2 current_cmd;
-
-	if (!vfe_dev || !arg) {
-		pr_err("%s:%d failed: vfe_dev %pK arg %pK\n",
-			__func__, __LINE__, vfe_dev, arg);
-		return -EINVAL;
-	}
-	msm_isp_compat_to_proc_cmd(&current_cmd, &proc_cmd->cfg_cmd);
-	rc = msm_isp_proc_cmd(vfe_dev, &current_cmd);
-	if (rc < 0)
-		pr_err("%s:%d failed: rc %d\n", __func__, __LINE__, rc);
-
-	cmd = *proc_cmd;
-
-	while (compat_ptr(cmd.next) != NULL) {
-		if (cmd.next_size != sizeof(struct msm_vfe_cfg_cmd_list_32)) {
-			pr_err("%s:%d failed: next size %u != expected %zu\n",
-				__func__, __LINE__, cmd.next_size,
-				sizeof(struct msm_vfe_cfg_cmd_list));
-			break;
-		}
-		if (++count >= MAX_ISP_REG_LIST) {
-			pr_err("%s:%d Error exceeding the max register count:%u\n",
-				__func__, __LINE__, count);
-			rc = -EINVAL;
-			break;
-		}
-		if (copy_from_user(&cmd_next, compat_ptr(cmd.next),
-			sizeof(struct msm_vfe_cfg_cmd_list_32))) {
-			rc = -EFAULT;
-			continue;
-		}
-		msm_isp_compat_to_proc_cmd(&current_cmd,
-			&cmd_next.cfg_cmd);
-
-		rc = msm_isp_proc_cmd(vfe_dev, &current_cmd);
-		if (rc < 0)
-			pr_err("%s:%d failed: rc %d\n", __func__, __LINE__, rc);
-
-		cmd = cmd_next;
-	}
-	return rc;
-}
-
-static int msm_isp_proc_cmd_list(struct vfe_device *vfe_dev, void *arg)
-{
-	if (is_compat_task())
-		return msm_isp_proc_cmd_list_compat(vfe_dev, arg);
-	else
-		return msm_isp_proc_cmd_list_unlocked(vfe_dev, arg);
-}
-#else /* CONFIG_COMPAT */
-static int msm_isp_proc_cmd_list(struct vfe_device *vfe_dev, void *arg)
-{
-	return msm_isp_proc_cmd_list_unlocked(vfe_dev, arg);
-}
-#endif /* CONFIG_COMPAT */
-
-static long msm_isp_ioctl_unlocked(struct v4l2_subdev *sd,
-	unsigned int cmd, void *arg)
-{
-	long rc = 0;
-	long rc2 = 0;
-	struct vfe_device *vfe_dev = v4l2_get_subdevdata(sd);
-
-	if (!vfe_dev || !vfe_dev->vfe_base) {
-		pr_err("%s:%d failed: invalid params %pK\n",
-			__func__, __LINE__, vfe_dev);
-		if (vfe_dev)
-			pr_err("%s:%d failed %pK\n", __func__,
-				__LINE__, vfe_dev->vfe_base);
-		return -EINVAL;
-	}
-
-	/* use real time mutex for hard real-time ioctls such as
-	 * buffer operations and register updates.
-	 * Use core mutex for other ioctls that could take
-	 * longer time to complete such as start/stop ISP streams
-	 * which blocks until the hardware start/stop streaming
-	 */
-	ISP_DBG("%s: cmd: %d\n", __func__, _IOC_TYPE(cmd));
-	switch (cmd) {
-	case VIDIOC_MSM_VFE_REG_CFG: {
-		mutex_lock(&vfe_dev->realtime_mutex);
-		rc = msm_isp_proc_cmd(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		break;
-	}
-	case VIDIOC_MSM_VFE_REG_LIST_CFG: {
-		mutex_lock(&vfe_dev->realtime_mutex);
-		rc = msm_isp_proc_cmd_list(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		break;
-	}
-	case VIDIOC_MSM_ISP_REQUEST_BUF:
-	case VIDIOC_MSM_ISP_REQUEST_BUF_VER2:
-		/* fallthrough */
-	case VIDIOC_MSM_ISP_ENQUEUE_BUF:
-		/* fallthrough */
-	case VIDIOC_MSM_ISP_DEQUEUE_BUF:
-		/* fallthrough */
-	case VIDIOC_MSM_ISP_UNMAP_BUF: {
-		mutex_lock(&vfe_dev->buf_mgr->lock);
-		rc = msm_isp_proc_buf_cmd(vfe_dev->buf_mgr, cmd, arg);
-		mutex_unlock(&vfe_dev->buf_mgr->lock);
-		break;
-	}
-	case VIDIOC_MSM_ISP_RELEASE_BUF: {
-		if (vfe_dev->buf_mgr == NULL) {
-			pr_err("%s: buf mgr NULL! rc = -1\n", __func__);
-			rc = -EINVAL;
-			return rc;
-		}
-		mutex_lock(&vfe_dev->buf_mgr->lock);
-		rc = msm_isp_proc_buf_cmd(vfe_dev->buf_mgr, cmd, arg);
-		mutex_unlock(&vfe_dev->buf_mgr->lock);
-		break;
-	}
-	case VIDIOC_MSM_ISP_REQUEST_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_request_axi_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_RELEASE_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_release_axi_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_CFG_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_cfg_axi_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_AXI_HALT:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_axi_halt(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_AXI_RESET:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		if (atomic_read(&vfe_dev->error_info.overflow_state)
-			!= HALT_ENFORCED) {
-			rc = msm_isp_stats_reset(vfe_dev);
-			rc2 = msm_isp_axi_reset(vfe_dev, arg);
-			if (!rc && rc2)
-				rc = rc2;
-		} else {
-			pr_err_ratelimited("%s: no HW reset, halt enforced.\n",
-				__func__);
-		}
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_AXI_RESTART:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		mutex_lock(&vfe_dev->buf_mgr->lock);
-		if (atomic_read(&vfe_dev->error_info.overflow_state)
-			!= HALT_ENFORCED) {
-			rc = msm_isp_stats_restart(vfe_dev);
-			rc2 = msm_isp_axi_restart(vfe_dev, arg);
-			if (!rc && rc2)
-				rc = rc2;
-		} else {
-			pr_err_ratelimited("%s: no AXI restart, halt enforced.\n",
-				__func__);
-		}
-		mutex_unlock(&vfe_dev->buf_mgr->lock);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_INPUT_CFG:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_cfg_input(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_AHB_CLK_CFG:
-		mutex_lock(&vfe_dev->core_mutex);
-		if (vfe_dev->hw_info->vfe_ops.core_ops.ahb_clk_cfg)
-			rc = vfe_dev->hw_info->vfe_ops.core_ops.ahb_clk_cfg(
-						vfe_dev, arg);
-		else
-			rc = -EOPNOTSUPP;
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_SET_DUAL_HW_MASTER_SLAVE:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_set_dual_HW_master_slave_mode(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_DUAL_HW_MASTER_SLAVE_SYNC:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_dual_hw_master_slave_sync(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_DUAL_HW_LPM_MODE:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_ab_ib_update_lpm_mode(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_FETCH_ENG_START:
-	case VIDIOC_MSM_ISP_MAP_BUF_START_FE:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_start_fetch_engine(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-
-	case VIDIOC_MSM_ISP_FETCH_ENG_MULTI_PASS_START:
-	case VIDIOC_MSM_ISP_MAP_BUF_START_MULTI_PASS_FE:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_start_fetch_engine_multi_pass(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_REG_UPDATE_CMD:
-		if (arg) {
-			enum msm_vfe_input_src frame_src =
-				*((enum msm_vfe_input_src *)arg);
-			vfe_dev->hw_info->vfe_ops.core_ops.reg_update(vfe_dev,
-				frame_src);
-		}
-		break;
-	case VIDIOC_MSM_ISP_SET_SRC_STATE:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_set_src_state(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_REQUEST_STATS_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_request_stats_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_RELEASE_STATS_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_release_stats_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_CFG_STATS_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_cfg_stats_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_UPDATE_STATS_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_update_stats_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_UPDATE_STREAM:
-		mutex_lock(&vfe_dev->core_mutex);
-		MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-		rc = msm_isp_update_axi_stream(vfe_dev, arg);
-		MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_SMMU_ATTACH:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_smmu_attach(vfe_dev->buf_mgr, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case MSM_SD_NOTIFY_FREEZE:
-		vfe_dev->isp_sof_debug = 0;
-		vfe_dev->isp_raw0_debug = 0;
-		vfe_dev->isp_raw1_debug = 0;
-		vfe_dev->isp_raw2_debug = 0;
-		break;
-	case MSM_SD_UNNOTIFY_FREEZE:
-	case MSM_SD_SHUTDOWN:
-		break;
-	case VIDIOC_MSM_ISP_DUAL_SYNC_CFG:
-		mutex_lock(&vfe_dev->core_mutex);
-		vfe_dev->dual_vfe_sync_enable =
-			*((uint32_t *)arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_DUAL_SYNC_CFG_VER2:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_set_dual_vfe_sync_mode(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	case VIDIOC_MSM_ISP_NANOSEC_TIMESTAMP:
-		mutex_lock(&vfe_dev->core_mutex);
-		rc = msm_isp_nano_sec_timestamp(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->core_mutex);
-		break;
-	default:
-		pr_err_ratelimited("%s: Invalid ISP command %x\n", __func__,
-				    cmd);
-		rc = -EINVAL;
-	}
-	return rc;
-}
-
-
-#ifdef CONFIG_COMPAT
-static long msm_isp_ioctl_compat(struct v4l2_subdev *sd,
-	unsigned int cmd, void *arg)
-{
-	struct vfe_device *vfe_dev = v4l2_get_subdevdata(sd);
-	long rc = 0;
-
-	if (!vfe_dev || !vfe_dev->vfe_base) {
-		pr_err("%s:%d failed: invalid params %pK\n",
-			__func__, __LINE__, vfe_dev);
-		if (vfe_dev)
-			pr_err("%s:%d failed %pK\n", __func__,
-				__LINE__, vfe_dev->vfe_base);
-		return -EINVAL;
-	}
-
-	switch (cmd) {
-	case VIDIOC_MSM_VFE_REG_CFG_COMPAT: {
-		struct msm_vfe_cfg_cmd2 proc_cmd;
-
-		mutex_lock(&vfe_dev->realtime_mutex);
-		msm_isp_compat_to_proc_cmd(&proc_cmd,
-			(struct msm_vfe_cfg_cmd2_32 *) arg);
-		rc = msm_isp_proc_cmd(vfe_dev, &proc_cmd);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		break;
-	}
-	case VIDIOC_MSM_VFE_REG_LIST_CFG_COMPAT: {
-		mutex_lock(&vfe_dev->realtime_mutex);
-		rc = msm_isp_proc_cmd_list(vfe_dev, arg);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		break;
-	}
-	default:
-		return msm_isp_ioctl_unlocked(sd, cmd, arg);
-	}
-
-	return rc;
-}
-
-long msm_isp_ioctl(struct v4l2_subdev *sd,
-	unsigned int cmd, void *arg)
-{
-	return msm_isp_ioctl_compat(sd, cmd, arg);
-}
-#else /* CONFIG_COMPAT */
-long msm_isp_ioctl(struct v4l2_subdev *sd,
-	unsigned int cmd, void *arg)
-{
-	return msm_isp_ioctl_unlocked(sd, cmd, arg);
-}
-#endif /* CONFIG_COMPAT */
-
-static int msm_isp_send_hw_cmd(struct vfe_device *vfe_dev,
-	struct msm_vfe_reg_cfg_cmd *reg_cfg_cmd,
-	uint32_t *cfg_data, uint32_t cmd_len)
-{
-	if (!vfe_dev || !reg_cfg_cmd) {
-		pr_err("%s:%d failed: vfe_dev %pK reg_cfg_cmd %pK\n", __func__,
-			__LINE__, vfe_dev, reg_cfg_cmd);
-		return -EINVAL;
-	}
-	if ((reg_cfg_cmd->cmd_type != VFE_CFG_MASK) &&
-		(!cfg_data || !cmd_len)) {
-		pr_err("%s:%d failed: cmd type %d cfg_data %pK cmd_len %d\n",
-			__func__, __LINE__, reg_cfg_cmd->cmd_type, cfg_data,
-			cmd_len);
-		return -EINVAL;
-	}
-
-	/* Validate input parameters */
-	switch (reg_cfg_cmd->cmd_type) {
-	case VFE_WRITE:
-	case VFE_READ:
-	case VFE_WRITE_MB: {
-		if ((reg_cfg_cmd->u.rw_info.reg_offset >
-			(UINT_MAX - reg_cfg_cmd->u.rw_info.len)) ||
-			((reg_cfg_cmd->u.rw_info.reg_offset +
-			reg_cfg_cmd->u.rw_info.len) >
-			vfe_dev->vfe_base_size) ||
-			(reg_cfg_cmd->u.rw_info.reg_offset & 0x3)) {
-			pr_err_ratelimited("%s:%d regoffset %d len %d res %d\n",
-				__func__, __LINE__,
-				reg_cfg_cmd->u.rw_info.reg_offset,
-				reg_cfg_cmd->u.rw_info.len,
-				(uint32_t)vfe_dev->vfe_base_size);
-			return -EINVAL;
-		}
-
-		if ((reg_cfg_cmd->u.rw_info.cmd_data_offset >
-			(UINT_MAX - reg_cfg_cmd->u.rw_info.len)) ||
-			((reg_cfg_cmd->u.rw_info.cmd_data_offset +
-			reg_cfg_cmd->u.rw_info.len) > cmd_len)) {
-			pr_err_ratelimited("%s:%d cmd_data_offset %d len %d cmd_len %d\n",
-				__func__, __LINE__,
-				reg_cfg_cmd->u.rw_info.cmd_data_offset,
-				reg_cfg_cmd->u.rw_info.len, cmd_len);
-			return -EINVAL;
-		}
-		break;
-	}
-
-	case VFE_WRITE_DMI_16BIT:
-	case VFE_WRITE_DMI_32BIT:
-	case VFE_WRITE_DMI_64BIT:
-	case VFE_READ_DMI_16BIT:
-	case VFE_READ_DMI_32BIT:
-	case VFE_READ_DMI_64BIT: {
-		if (reg_cfg_cmd->cmd_type == VFE_WRITE_DMI_64BIT ||
-			reg_cfg_cmd->cmd_type == VFE_READ_DMI_64BIT) {
-			if ((reg_cfg_cmd->u.dmi_info.hi_tbl_offset <=
-				reg_cfg_cmd->u.dmi_info.lo_tbl_offset) ||
-				(reg_cfg_cmd->u.dmi_info.hi_tbl_offset -
-				reg_cfg_cmd->u.dmi_info.lo_tbl_offset !=
-				(sizeof(uint32_t)))) {
-				pr_err("%s:%d hi %d lo %d\n",
-					__func__, __LINE__,
-					reg_cfg_cmd->u.dmi_info.hi_tbl_offset,
-					reg_cfg_cmd->u.dmi_info.hi_tbl_offset);
-				return -EINVAL;
-			}
-			if (reg_cfg_cmd->u.dmi_info.len <= sizeof(uint32_t)) {
-				pr_err("%s:%d len %d\n",
-					__func__, __LINE__,
-					reg_cfg_cmd->u.dmi_info.len);
-				return -EINVAL;
-			}
-			if (((UINT_MAX -
-				reg_cfg_cmd->u.dmi_info.hi_tbl_offset) <
-				(reg_cfg_cmd->u.dmi_info.len -
-				sizeof(uint32_t))) ||
-				((reg_cfg_cmd->u.dmi_info.hi_tbl_offset +
-				reg_cfg_cmd->u.dmi_info.len -
-				sizeof(uint32_t)) > cmd_len)) {
-				pr_err("%s:%d hi_tbl_offset %d len %d cmd %d\n",
-					__func__, __LINE__,
-					reg_cfg_cmd->u.dmi_info.hi_tbl_offset,
-					reg_cfg_cmd->u.dmi_info.len, cmd_len);
-				return -EINVAL;
-			}
-		}
-		if ((reg_cfg_cmd->u.dmi_info.lo_tbl_offset >
-			(UINT_MAX - reg_cfg_cmd->u.dmi_info.len)) ||
-			((reg_cfg_cmd->u.dmi_info.lo_tbl_offset +
-			reg_cfg_cmd->u.dmi_info.len) > cmd_len)) {
-			pr_err("%s:%d lo_tbl_offset %d len %d cmd_len %d\n",
-				__func__, __LINE__,
-				reg_cfg_cmd->u.dmi_info.lo_tbl_offset,
-				reg_cfg_cmd->u.dmi_info.len, cmd_len);
-			return -EINVAL;
-		}
-		break;
-	}
-
-	default:
-		break;
-	}
-
-	switch (reg_cfg_cmd->cmd_type) {
-	case VFE_WRITE: {
-		msm_camera_io_memcpy(vfe_dev->vfe_base +
-			reg_cfg_cmd->u.rw_info.reg_offset,
-			cfg_data + reg_cfg_cmd->u.rw_info.cmd_data_offset/4,
-			reg_cfg_cmd->u.rw_info.len);
-		break;
-	}
-	case VFE_WRITE_MB: {
-		msm_camera_io_memcpy_mb(vfe_dev->vfe_base +
-			reg_cfg_cmd->u.rw_info.reg_offset,
-			cfg_data + reg_cfg_cmd->u.rw_info.cmd_data_offset/4,
-			reg_cfg_cmd->u.rw_info.len);
-		break;
-	}
-	case VFE_CFG_MASK: {
-		uint32_t temp;
-		bool grab_lock;
-		unsigned long flags;
-
-		if ((UINT_MAX - sizeof(temp) <
-			reg_cfg_cmd->u.mask_info.reg_offset) ||
-			(vfe_dev->vfe_base_size <
-			reg_cfg_cmd->u.mask_info.reg_offset +
-			sizeof(temp)) ||
-			(reg_cfg_cmd->u.mask_info.reg_offset & 0x3)) {
-			pr_err("%s: VFE_CFG_MASK: Invalid length\n", __func__);
-			return -EINVAL;
-		}
-		grab_lock =
-			vfe_dev->hw_info->vfe_ops.core_ops
-				.is_module_cfg_lock_needed(
-					reg_cfg_cmd->u.mask_info.reg_offset);
-		if (grab_lock)
-			spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
-		else
-			__acquire(&vfe_dev->shared_data_lock);
-		temp = msm_camera_io_r(vfe_dev->vfe_base +
-			reg_cfg_cmd->u.mask_info.reg_offset);
-
-		temp &= ~reg_cfg_cmd->u.mask_info.mask;
-		temp |= reg_cfg_cmd->u.mask_info.val;
-		msm_camera_io_w(temp, vfe_dev->vfe_base +
-			reg_cfg_cmd->u.mask_info.reg_offset);
-		if (grab_lock)
-			spin_unlock_irqrestore(&vfe_dev->shared_data_lock,
-				flags);
-		else
-			__release(&vfe_dev->shared_data_lock);
-		break;
-	}
-	case VFE_WRITE_DMI_16BIT:
-	case VFE_WRITE_DMI_32BIT:
-	case VFE_WRITE_DMI_64BIT: {
-		int i;
-		uint32_t *hi_tbl_ptr = NULL, *lo_tbl_ptr = NULL;
-		uint32_t hi_val, lo_val, lo_val1;
-
-		if (reg_cfg_cmd->cmd_type == VFE_WRITE_DMI_64BIT) {
-			hi_tbl_ptr = cfg_data +
-				reg_cfg_cmd->u.dmi_info.hi_tbl_offset/4;
-		}
-		lo_tbl_ptr = cfg_data +
-			reg_cfg_cmd->u.dmi_info.lo_tbl_offset/4;
-		if (reg_cfg_cmd->cmd_type == VFE_WRITE_DMI_64BIT)
-			reg_cfg_cmd->u.dmi_info.len =
-				reg_cfg_cmd->u.dmi_info.len / 2;
-		for (i = 0; i < reg_cfg_cmd->u.dmi_info.len/4; i++) {
-			lo_val = *lo_tbl_ptr++;
-			if (reg_cfg_cmd->cmd_type == VFE_WRITE_DMI_16BIT) {
-				lo_val1 = lo_val & 0x0000FFFF;
-				lo_val = (lo_val & 0xFFFF0000)>>16;
-				msm_camera_io_w(lo_val1, vfe_dev->vfe_base +
-					vfe_dev->hw_info->dmi_reg_offset + 0x4);
-			} else if (reg_cfg_cmd->cmd_type ==
-					   VFE_WRITE_DMI_64BIT) {
-				lo_tbl_ptr++;
-				hi_val = *hi_tbl_ptr;
-				hi_tbl_ptr = hi_tbl_ptr + 2;
-				msm_camera_io_w(hi_val, vfe_dev->vfe_base +
-					vfe_dev->hw_info->dmi_reg_offset);
-			}
-			msm_camera_io_w(lo_val, vfe_dev->vfe_base +
-				vfe_dev->hw_info->dmi_reg_offset + 0x4);
-		}
-		break;
-	}
-	case VFE_READ_DMI_16BIT:
-	case VFE_READ_DMI_32BIT:
-	case VFE_READ_DMI_64BIT: {
-		int i;
-		uint32_t *hi_tbl_ptr = NULL, *lo_tbl_ptr = NULL;
-		uint32_t hi_val, lo_val, lo_val1;
-
-		if (reg_cfg_cmd->cmd_type == VFE_READ_DMI_64BIT) {
-			hi_tbl_ptr = cfg_data +
-				reg_cfg_cmd->u.dmi_info.hi_tbl_offset/4;
-		}
-
-		lo_tbl_ptr = cfg_data +
-			reg_cfg_cmd->u.dmi_info.lo_tbl_offset/4;
-
-		if (reg_cfg_cmd->cmd_type == VFE_READ_DMI_64BIT)
-			reg_cfg_cmd->u.dmi_info.len =
-				reg_cfg_cmd->u.dmi_info.len / 2;
-
-		for (i = 0; i < reg_cfg_cmd->u.dmi_info.len/4; i++) {
-			lo_val = msm_camera_io_r(vfe_dev->vfe_base +
-					vfe_dev->hw_info->dmi_reg_offset + 0x4);
-
-			if (reg_cfg_cmd->cmd_type == VFE_READ_DMI_16BIT) {
-				lo_val1 = msm_camera_io_r(vfe_dev->vfe_base +
-					vfe_dev->hw_info->dmi_reg_offset + 0x4);
-				lo_val |= lo_val1 << 16;
-			}
-			*lo_tbl_ptr++ = lo_val;
-			if (reg_cfg_cmd->cmd_type == VFE_READ_DMI_64BIT) {
-				hi_val = msm_camera_io_r(vfe_dev->vfe_base +
-					vfe_dev->hw_info->dmi_reg_offset);
-				*hi_tbl_ptr = hi_val;
-				hi_tbl_ptr += 2;
-				lo_tbl_ptr++;
-			}
-		}
-		break;
-	}
-	case VFE_HW_UPDATE_LOCK: {
-		uint32_t update_id =
-			vfe_dev->axi_data.src_info[VFE_PIX_0].last_updt_frm_id;
-		if (vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id != *cfg_data
-			|| update_id == *cfg_data) {
-			pr_err("%s hw update lock failed acq %d, cur id %u, last id %u\n",
-				__func__,
-				*cfg_data,
-				vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id,
-				update_id);
-			return -EINVAL;
-		}
-		break;
-	}
-	case VFE_HW_UPDATE_UNLOCK: {
-		if (vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id
-			!= *cfg_data) {
-			pr_err("hw update across frame boundary,begin id %u, end id %d\n",
-				*cfg_data,
-				vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id);
-		}
-		vfe_dev->axi_data.src_info[VFE_PIX_0].last_updt_frm_id =
-			vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id;
-		break;
-	}
-	case VFE_READ: {
-		int i;
-		uint32_t *data_ptr = cfg_data +
-			reg_cfg_cmd->u.rw_info.cmd_data_offset/4;
-		for (i = 0; i < reg_cfg_cmd->u.rw_info.len/4; i++) {
-			if ((data_ptr < cfg_data) ||
-				(UINT_MAX / sizeof(*data_ptr) <
-				 (data_ptr - cfg_data)) ||
-				(sizeof(*data_ptr) * (data_ptr - cfg_data) >=
-				 cmd_len))
-				return -EINVAL;
-			*data_ptr++ = msm_camera_io_r(vfe_dev->vfe_base +
-				reg_cfg_cmd->u.rw_info.reg_offset);
-			reg_cfg_cmd->u.rw_info.reg_offset += 4;
-		}
-		break;
-	}
-	case GET_MAX_CLK_RATE: {
-		int rc = 0;
-		unsigned long rate;
-
-		if (cmd_len != sizeof(__u32)) {
-			pr_err("%s:%d failed: invalid cmd len %u exp %zu\n",
-				__func__, __LINE__, cmd_len,
-				sizeof(__u32));
-			return -EINVAL;
-		}
-		rc = vfe_dev->hw_info->vfe_ops.platform_ops.get_max_clk_rate(
-							vfe_dev, &rate);
-		if (rc < 0) {
-			pr_err("%s:%d failed: rc %d\n", __func__, __LINE__, rc);
-			return -EINVAL;
-		}
-
-		*(__u32 *)cfg_data = (__u32)rate;
-
-		break;
-	}
-	case GET_CLK_RATES: {
-		int rc = 0;
-		struct msm_isp_clk_rates rates;
-		struct msm_isp_clk_rates *user_data =
-			(struct msm_isp_clk_rates *)cfg_data;
-		if (cmd_len != sizeof(struct msm_isp_clk_rates)) {
-			pr_err("%s:%d failed: invalid cmd len %u exp %zu\n",
-				__func__, __LINE__, cmd_len,
-				sizeof(struct msm_isp_clk_rates));
-			return -EINVAL;
-		}
-		rc = vfe_dev->hw_info->vfe_ops.platform_ops.get_clk_rates(
-							vfe_dev, &rates);
-		if (rc < 0) {
-			pr_err("%s:%d failed: rc %d\n", __func__, __LINE__, rc);
-			return -EINVAL;
-		}
-		user_data->svs_rate = rates.svs_rate;
-		user_data->nominal_rate = rates.nominal_rate;
-		user_data->high_rate = rates.high_rate;
-		break;
-	}
-	case GET_ISP_ID: {
-		uint32_t *isp_id = NULL;
-
-		if (cmd_len < sizeof(uint32_t)) {
-			pr_err("%s:%d failed: invalid cmd len %u exp %zu\n",
-				__func__, __LINE__, cmd_len,
-				sizeof(uint32_t));
-			return -EINVAL;
-		}
-
-		isp_id = (uint32_t *)cfg_data;
-		*isp_id = vfe_dev->pdev->id;
-		break;
-	}
-	case SET_WM_UB_SIZE:
-		break;
-	case SET_UB_POLICY: {
-
-		if (cmd_len < sizeof(vfe_dev->vfe_ub_policy)) {
-			pr_err("%s:%d failed: invalid cmd len %u exp %zu\n",
-				__func__, __LINE__, cmd_len,
-				sizeof(vfe_dev->vfe_ub_policy));
-			return -EINVAL;
-		}
-		vfe_dev->vfe_ub_policy = *cfg_data;
-		break;
-	}
-	case GET_VFE_HW_LIMIT: {
-		uint32_t *hw_limit = NULL;
-
-		if (cmd_len < sizeof(uint32_t)) {
-			pr_err("%s:%d failed: invalid cmd len %u exp %zu\n",
-				__func__, __LINE__, cmd_len,
-				sizeof(uint32_t));
-			return -EINVAL;
-		}
-
-		hw_limit = (uint32_t *)cfg_data;
-		*hw_limit = vfe_dev->vfe_hw_limit;
-		break;
-	}
-	}
-	return 0;
-}
-
-int msm_isp_proc_cmd(struct vfe_device *vfe_dev, void *arg)
-{
-	int rc = 0, i;
-	struct msm_vfe_cfg_cmd2 *proc_cmd = arg;
-	struct msm_vfe_reg_cfg_cmd *reg_cfg_cmd = NULL;
-	uint32_t *cfg_data = NULL;
-
-	if (proc_cmd->num_cfg > 0 &&
-			proc_cmd->num_cfg <= UINT16_MAX) {
-		reg_cfg_cmd = kcalloc(proc_cmd->num_cfg,
-			sizeof(struct msm_vfe_reg_cfg_cmd), GFP_KERNEL);
-		if (!reg_cfg_cmd) {
-			rc = -ENOMEM;
-			goto reg_cfg_failed;
-		}
-
-		if (copy_from_user(reg_cfg_cmd,
-			(void __user *)(proc_cmd->cfg_cmd),
-			sizeof(struct msm_vfe_reg_cfg_cmd)
-				* proc_cmd->num_cfg)) {
-			rc = -EFAULT;
-			goto copy_cmd_failed;
-		}
-	} else {
-		pr_err("%s: Passed num_cfg as 0\n", __func__);
-		return -EINVAL;
-	}
-	if (proc_cmd->cmd_len > 0 &&
-			proc_cmd->cmd_len <= UINT16_MAX) {
-		cfg_data = memdup_user((void __user *)(proc_cmd->cfg_data),
-			proc_cmd->cmd_len);
-		if (IS_ERR(cfg_data)) {
-			kfree(reg_cfg_cmd);
-			return PTR_ERR(cfg_data);
-		}
-	} else {
-		pr_debug("%s: Passed cmd_len as 0\n", __func__);
-	}
-	for (i = 0; i < proc_cmd->num_cfg; i++)
-		rc = msm_isp_send_hw_cmd(vfe_dev, &reg_cfg_cmd[i],
-			cfg_data, proc_cmd->cmd_len);
-
-	if (copy_to_user(proc_cmd->cfg_data,
-		cfg_data, proc_cmd->cmd_len)) {
-		rc = -EFAULT;
-		goto copy_cmd_failed;
-	}
-
-copy_cmd_failed:
-	kfree(cfg_data);
-reg_cfg_failed:
-	kfree(reg_cfg_cmd);
-	return rc;
-}
-
-int msm_isp_send_event(struct vfe_device *vfe_dev,
-	uint32_t event_type,
-	struct msm_isp_event_data *event_data)
-{
-	struct v4l2_event isp_event;
-
-	memset(&isp_event, 0, sizeof(struct v4l2_event));
-	isp_event.id = 0;
-	isp_event.type = event_type;
-	memcpy(&isp_event.u.data[0], event_data,
-		sizeof(struct msm_isp_event_data));
-	v4l2_event_queue(vfe_dev->subdev.sd.devnode, &isp_event);
-	return 0;
-}
-
-int msm_isp_send_event_update_nanosec(struct vfe_device *vfe_dev,
-	uint32_t event_type,
-	struct msm_isp_event_data_nanosec *event_data)
-{
-	struct v4l2_event isp_event;
-
-	memset(&isp_event, 0, sizeof(struct v4l2_event));
-	isp_event.id = 0;
-	isp_event.type = event_type;
-	memcpy(&isp_event.u.data[0], event_data,
-		sizeof(struct msm_isp_event_data_nanosec));
-	v4l2_event_queue(vfe_dev->subdev.sd.devnode, &isp_event);
-	return 0;
-}
-
-#define CAL_WORD(width, M, N) ((width * M + N - 1) / N)
-
-int msm_isp_cal_word_per_line(uint32_t output_format,
-	uint32_t pixel_per_line)
-{
-	int val = -1;
-
-	switch (output_format) {
-	case V4L2_PIX_FMT_SBGGR8:
-	case V4L2_PIX_FMT_SGBRG8:
-	case V4L2_PIX_FMT_SGRBG8:
-	case V4L2_PIX_FMT_SRGGB8:
-	case V4L2_PIX_FMT_QBGGR8:
-	case V4L2_PIX_FMT_QGBRG8:
-	case V4L2_PIX_FMT_QGRBG8:
-	case V4L2_PIX_FMT_QRGGB8:
-	case V4L2_PIX_FMT_JPEG:
-	case V4L2_PIX_FMT_META:
-	case V4L2_PIX_FMT_GREY:
-		val = CAL_WORD(pixel_per_line, 1, 8);
-		break;
-	case V4L2_PIX_FMT_SBGGR10:
-	case V4L2_PIX_FMT_SGBRG10:
-	case V4L2_PIX_FMT_SGRBG10:
-	case V4L2_PIX_FMT_SRGGB10:
-	case V4L2_PIX_FMT_SBGGR10DPCM6:
-	case V4L2_PIX_FMT_SGBRG10DPCM6:
-	case V4L2_PIX_FMT_SGRBG10DPCM6:
-	case V4L2_PIX_FMT_SRGGB10DPCM6:
-	case V4L2_PIX_FMT_SBGGR10DPCM8:
-	case V4L2_PIX_FMT_SGBRG10DPCM8:
-	case V4L2_PIX_FMT_SGRBG10DPCM8:
-	case V4L2_PIX_FMT_SRGGB10DPCM8:
-	case V4L2_PIX_FMT_META10:
-		val = CAL_WORD(pixel_per_line, 5, 32);
-		break;
-	case V4L2_PIX_FMT_SBGGR12:
-	case V4L2_PIX_FMT_SGBRG12:
-	case V4L2_PIX_FMT_SGRBG12:
-	case V4L2_PIX_FMT_SRGGB12:
-		val = CAL_WORD(pixel_per_line, 3, 16);
-		break;
-	case V4L2_PIX_FMT_SBGGR14:
-	case V4L2_PIX_FMT_SGBRG14:
-	case V4L2_PIX_FMT_SGRBG14:
-	case V4L2_PIX_FMT_SRGGB14:
-		val = CAL_WORD(pixel_per_line, 7, 32);
-		break;
-	case V4L2_PIX_FMT_QBGGR10:
-	case V4L2_PIX_FMT_QGBRG10:
-	case V4L2_PIX_FMT_QGRBG10:
-	case V4L2_PIX_FMT_QRGGB10:
-		val = CAL_WORD(pixel_per_line, 1, 6);
-		break;
-	case V4L2_PIX_FMT_QBGGR12:
-	case V4L2_PIX_FMT_QGBRG12:
-	case V4L2_PIX_FMT_QGRBG12:
-	case V4L2_PIX_FMT_QRGGB12:
-		val = CAL_WORD(pixel_per_line, 1, 5);
-		break;
-	case V4L2_PIX_FMT_QBGGR14:
-	case V4L2_PIX_FMT_QGBRG14:
-	case V4L2_PIX_FMT_QGRBG14:
-	case V4L2_PIX_FMT_QRGGB14:
-		val = CAL_WORD(pixel_per_line, 1, 4);
-		break;
-	case V4L2_PIX_FMT_NV12:
-	case V4L2_PIX_FMT_NV21:
-	case V4L2_PIX_FMT_NV14:
-	case V4L2_PIX_FMT_NV41:
-	case V4L2_PIX_FMT_NV16:
-	case V4L2_PIX_FMT_NV61:
-		val = CAL_WORD(pixel_per_line, 1, 8);
-		break;
-	case V4L2_PIX_FMT_YUYV:
-	case V4L2_PIX_FMT_YVYU:
-	case V4L2_PIX_FMT_UYVY:
-	case V4L2_PIX_FMT_VYUY:
-		val = CAL_WORD(pixel_per_line, 2, 8);
-	break;
-	case V4L2_PIX_FMT_P16BGGR10:
-	case V4L2_PIX_FMT_P16GBRG10:
-	case V4L2_PIX_FMT_P16GRBG10:
-	case V4L2_PIX_FMT_P16RGGB10:
-	case V4L2_PIX_FMT_P16BGGR12:
-	case V4L2_PIX_FMT_P16GBRG12:
-	case V4L2_PIX_FMT_P16GRBG12:
-	case V4L2_PIX_FMT_P16RGGB12:
-		val = CAL_WORD(pixel_per_line, 1, 4);
-	break;
-	case V4L2_PIX_FMT_NV24:
-	case V4L2_PIX_FMT_NV42:
-		val = CAL_WORD(pixel_per_line, 1, 8);
-	break;
-		/*TD: Add more image format*/
-	default:
-		msm_isp_print_fourcc_error(__func__, output_format);
-		break;
-	}
-	return val;
-}
-
-enum msm_isp_pack_fmt msm_isp_get_pack_format(uint32_t output_format)
-{
-	switch (output_format) {
-	case V4L2_PIX_FMT_SBGGR8:
-	case V4L2_PIX_FMT_SGBRG8:
-	case V4L2_PIX_FMT_SGRBG8:
-	case V4L2_PIX_FMT_SRGGB8:
-	case V4L2_PIX_FMT_SBGGR10:
-	case V4L2_PIX_FMT_SGBRG10:
-	case V4L2_PIX_FMT_SGRBG10:
-	case V4L2_PIX_FMT_SRGGB10:
-	case V4L2_PIX_FMT_SBGGR10DPCM6:
-	case V4L2_PIX_FMT_SGBRG10DPCM6:
-	case V4L2_PIX_FMT_SGRBG10DPCM6:
-	case V4L2_PIX_FMT_SRGGB10DPCM6:
-	case V4L2_PIX_FMT_SBGGR10DPCM8:
-	case V4L2_PIX_FMT_SGBRG10DPCM8:
-	case V4L2_PIX_FMT_SGRBG10DPCM8:
-	case V4L2_PIX_FMT_SRGGB10DPCM8:
-	case V4L2_PIX_FMT_SBGGR12:
-	case V4L2_PIX_FMT_SGBRG12:
-	case V4L2_PIX_FMT_SGRBG12:
-	case V4L2_PIX_FMT_SRGGB12:
-	case V4L2_PIX_FMT_SBGGR14:
-	case V4L2_PIX_FMT_SGBRG14:
-	case V4L2_PIX_FMT_SGRBG14:
-	case V4L2_PIX_FMT_SRGGB14:
-		return MIPI;
-	case V4L2_PIX_FMT_QBGGR8:
-	case V4L2_PIX_FMT_QGBRG8:
-	case V4L2_PIX_FMT_QGRBG8:
-	case V4L2_PIX_FMT_QRGGB8:
-	case V4L2_PIX_FMT_QBGGR10:
-	case V4L2_PIX_FMT_QGBRG10:
-	case V4L2_PIX_FMT_QGRBG10:
-	case V4L2_PIX_FMT_QRGGB10:
-	case V4L2_PIX_FMT_QBGGR12:
-	case V4L2_PIX_FMT_QGBRG12:
-	case V4L2_PIX_FMT_QGRBG12:
-	case V4L2_PIX_FMT_QRGGB12:
-	case V4L2_PIX_FMT_QBGGR14:
-	case V4L2_PIX_FMT_QGBRG14:
-	case V4L2_PIX_FMT_QGRBG14:
-	case V4L2_PIX_FMT_QRGGB14:
-		return QCOM;
-	case V4L2_PIX_FMT_P16BGGR10:
-	case V4L2_PIX_FMT_P16GBRG10:
-	case V4L2_PIX_FMT_P16GRBG10:
-	case V4L2_PIX_FMT_P16RGGB10:
-	case V4L2_PIX_FMT_P16BGGR12:
-	case V4L2_PIX_FMT_P16GBRG12:
-	case V4L2_PIX_FMT_P16GRBG12:
-	case V4L2_PIX_FMT_P16RGGB12:
-		return PLAIN16;
-	default:
-		msm_isp_print_fourcc_error(__func__, output_format);
-		break;
-	}
-	return -EINVAL;
-}
-
-int msm_isp_get_bit_per_pixel(uint32_t output_format)
-{
-	switch (output_format) {
-	case V4L2_PIX_FMT_Y4:
-		return 4;
-	case V4L2_PIX_FMT_Y6:
-		return 6;
-	case V4L2_PIX_FMT_SBGGR8:
-	case V4L2_PIX_FMT_SGBRG8:
-	case V4L2_PIX_FMT_SGRBG8:
-	case V4L2_PIX_FMT_SRGGB8:
-	case V4L2_PIX_FMT_QBGGR8:
-	case V4L2_PIX_FMT_QGBRG8:
-	case V4L2_PIX_FMT_QGRBG8:
-	case V4L2_PIX_FMT_QRGGB8:
-	case V4L2_PIX_FMT_JPEG:
-	case V4L2_PIX_FMT_META:
-	case V4L2_PIX_FMT_NV12:
-	case V4L2_PIX_FMT_NV21:
-	case V4L2_PIX_FMT_NV14:
-	case V4L2_PIX_FMT_NV41:
-	case V4L2_PIX_FMT_YVU410:
-	case V4L2_PIX_FMT_YVU420:
-	case V4L2_PIX_FMT_YUYV:
-	case V4L2_PIX_FMT_YYUV:
-	case V4L2_PIX_FMT_YVYU:
-	case V4L2_PIX_FMT_UYVY:
-	case V4L2_PIX_FMT_VYUY:
-	case V4L2_PIX_FMT_YUV422P:
-	case V4L2_PIX_FMT_YUV411P:
-	case V4L2_PIX_FMT_Y41P:
-	case V4L2_PIX_FMT_YUV444:
-	case V4L2_PIX_FMT_YUV555:
-	case V4L2_PIX_FMT_YUV565:
-	case V4L2_PIX_FMT_YUV32:
-	case V4L2_PIX_FMT_YUV410:
-	case V4L2_PIX_FMT_YUV420:
-	case V4L2_PIX_FMT_GREY:
-	case V4L2_PIX_FMT_PAL8:
-	case V4L2_PIX_FMT_UV8:
-	case MSM_V4L2_PIX_FMT_META:
-		return 8;
-	case V4L2_PIX_FMT_SBGGR10:
-	case V4L2_PIX_FMT_SGBRG10:
-	case V4L2_PIX_FMT_SGRBG10:
-	case V4L2_PIX_FMT_SRGGB10:
-	case V4L2_PIX_FMT_SBGGR10DPCM6:
-	case V4L2_PIX_FMT_SGBRG10DPCM6:
-	case V4L2_PIX_FMT_SGRBG10DPCM6:
-	case V4L2_PIX_FMT_SRGGB10DPCM6:
-	case V4L2_PIX_FMT_SBGGR10DPCM8:
-	case V4L2_PIX_FMT_SGBRG10DPCM8:
-	case V4L2_PIX_FMT_SGRBG10DPCM8:
-	case V4L2_PIX_FMT_SRGGB10DPCM8:
-	case V4L2_PIX_FMT_QBGGR10:
-	case V4L2_PIX_FMT_QGBRG10:
-	case V4L2_PIX_FMT_QGRBG10:
-	case V4L2_PIX_FMT_QRGGB10:
-	case V4L2_PIX_FMT_Y10:
-	case V4L2_PIX_FMT_Y10BPACK:
-	case V4L2_PIX_FMT_P16BGGR10:
-	case V4L2_PIX_FMT_P16GBRG10:
-	case V4L2_PIX_FMT_P16GRBG10:
-	case V4L2_PIX_FMT_P16RGGB10:
-	case V4L2_PIX_FMT_META10:
-	case MSM_V4L2_PIX_FMT_META10:
-		return 10;
-	case V4L2_PIX_FMT_SBGGR12:
-	case V4L2_PIX_FMT_SGBRG12:
-	case V4L2_PIX_FMT_SGRBG12:
-	case V4L2_PIX_FMT_SRGGB12:
-	case V4L2_PIX_FMT_QBGGR12:
-	case V4L2_PIX_FMT_QGBRG12:
-	case V4L2_PIX_FMT_QGRBG12:
-	case V4L2_PIX_FMT_QRGGB12:
-	case V4L2_PIX_FMT_Y12:
-	case V4L2_PIX_FMT_P16BGGR12:
-	case V4L2_PIX_FMT_P16GBRG12:
-	case V4L2_PIX_FMT_P16GRBG12:
-	case V4L2_PIX_FMT_P16RGGB12:
-	case MSM_V4L2_PIX_FMT_META12:
-		return 12;
-	case V4L2_PIX_FMT_SBGGR14:
-	case V4L2_PIX_FMT_SGBRG14:
-	case V4L2_PIX_FMT_SGRBG14:
-	case V4L2_PIX_FMT_SRGGB14:
-	case V4L2_PIX_FMT_QBGGR14:
-	case V4L2_PIX_FMT_QGBRG14:
-	case V4L2_PIX_FMT_QGRBG14:
-	case V4L2_PIX_FMT_QRGGB14:
-		return 14;
-	case V4L2_PIX_FMT_NV16:
-	case V4L2_PIX_FMT_NV61:
-	case V4L2_PIX_FMT_Y16:
-		return 16;
-	case V4L2_PIX_FMT_NV24:
-	case V4L2_PIX_FMT_NV42:
-		return 24;
-		/*TD: Add more image format*/
-	default:
-		msm_isp_print_fourcc_error(__func__, output_format);
-		pr_err("%s: Invalid output format %x\n",
-			__func__, output_format);
-		return -EINVAL;
-	}
-}
-
-void msm_isp_update_error_frame_count(struct vfe_device *vfe_dev)
-{
-	struct msm_vfe_error_info *error_info = &vfe_dev->error_info;
-
-	error_info->info_dump_frame_count++;
-}
-
-
-static int msm_isp_process_iommu_page_fault(struct vfe_device *vfe_dev)
-{
-	int rc = vfe_dev->buf_mgr->pagefault_debug_disable;
-	uint32_t irq_status0, irq_status1;
-	uint32_t overflow_mask;
-	unsigned long irq_flags;
-
-	/* Check if any overflow bit is set */
-	vfe_dev->hw_info->vfe_ops.core_ops.get_overflow_mask(&overflow_mask);
-	vfe_dev->hw_info->vfe_ops.irq_ops.read_irq_status(vfe_dev,
-				&irq_status0, &irq_status1);
-	overflow_mask &= irq_status1;
-	spin_lock_irqsave(
-		&vfe_dev->common_data->common_dev_data_lock, irq_flags);
-	if (overflow_mask ||
-		atomic_read(&vfe_dev->error_info.overflow_state) !=
-			NO_OVERFLOW) {
-		spin_unlock_irqrestore(
-			&vfe_dev->common_data->common_dev_data_lock, irq_flags);
-		pr_err_ratelimited("%s: overflow detected during IOMMU\n",
-			__func__);
-		/* Don't treat the Overflow + Page fault scenario as fatal.
-		 * Instead try to do a recovery. Using an existing event as
-		 * as opposed to creating a new event.
-		 */
-		msm_isp_halt_send_error(vfe_dev, ISP_EVENT_PING_PONG_MISMATCH);
-	} else {
-		spin_unlock_irqrestore(
-			&vfe_dev->common_data->common_dev_data_lock, irq_flags);
-		pr_err("%s:%d] VFE%d Handle Page fault! vfe_dev %pK\n",
-			__func__, __LINE__,  vfe_dev->pdev->id, vfe_dev);
-		vfe_dev->hw_info->vfe_ops.axi_ops.halt(vfe_dev, 0);
-		msm_isp_halt_send_error(vfe_dev, ISP_EVENT_IOMMU_P_FAULT);
-	}
-
-	if (vfe_dev->buf_mgr->pagefault_debug_disable == 0) {
-		vfe_dev->buf_mgr->pagefault_debug_disable = 1;
-		vfe_dev->buf_mgr->ops->buf_mgr_debug(vfe_dev->buf_mgr,
-			vfe_dev->page_fault_addr);
-		msm_isp_print_ping_pong_address(vfe_dev,
-			vfe_dev->page_fault_addr);
-		vfe_dev->hw_info->vfe_ops.axi_ops
-			.read_wm_ping_pong_addr(vfe_dev);
-	}
-	return rc;
-}
-
-void msm_isp_process_error_info(struct vfe_device *vfe_dev)
-{
-	struct msm_vfe_error_info *error_info = &vfe_dev->error_info;
-
-	if (error_info->error_count == 1 ||
-		!(error_info->info_dump_frame_count % 100)) {
-		vfe_dev->hw_info->vfe_ops.core_ops.process_error_status(
-				vfe_dev);
-		error_info->error_mask0 = 0;
-		error_info->error_mask1 = 0;
-		error_info->camif_status = 0;
-		error_info->violation_status = 0;
-	}
-}
-
-static inline void msm_isp_update_error_info(struct vfe_device *vfe_dev,
-	uint32_t error_mask0, uint32_t error_mask1)
-{
-	vfe_dev->error_info.error_mask0 |= error_mask0;
-	vfe_dev->error_info.error_mask1 |= error_mask1;
-	vfe_dev->error_info.error_count++;
-}
-
-int msm_isp_process_overflow_irq(
-	struct vfe_device *vfe_dev,
-	uint32_t *irq_status0, uint32_t *irq_status1,
-	uint8_t force_overflow)
-{
-	uint32_t overflow_mask;
-	uint32_t bus_err = 0;
-	unsigned long flags;
-
-	/* if there are no active streams - do not start recovery */
-	if (!vfe_dev->axi_data.num_active_stream)
-		return 0;
-
-	if (vfe_dev->hw_info->vfe_ops.core_ops.get_bus_err_mask)
-		vfe_dev->hw_info->vfe_ops.core_ops.get_bus_err_mask(
-			vfe_dev, &bus_err, irq_status1);
-	/* Mask out all other irqs if recovery is started */
-	if (atomic_read(&vfe_dev->error_info.overflow_state) != NO_OVERFLOW) {
-		uint32_t halt_restart_mask0, halt_restart_mask1;
-
-		vfe_dev->hw_info->vfe_ops.core_ops.get_halt_restart_mask(
-			&halt_restart_mask0, &halt_restart_mask1);
-		*irq_status0 &= halt_restart_mask0;
-		*irq_status1 &= halt_restart_mask1;
-
-		return 0;
-	}
-
-	/* Check if any overflow bit is set */
-	vfe_dev->hw_info->vfe_ops.core_ops.get_overflow_mask(&overflow_mask);
-	overflow_mask &= *irq_status1;
-
-	if (overflow_mask || force_overflow) {
-		struct msm_isp_event_data error_event;
-		int i;
-		struct msm_vfe_axi_shared_data *axi_data = &vfe_dev->axi_data;
-
-		spin_lock_irqsave(
-			&vfe_dev->common_data->common_dev_data_lock, flags);
-
-		if (atomic_cmpxchg(&vfe_dev->error_info.overflow_state,
-				NO_OVERFLOW, OVERFLOW_DETECTED)) {
-			spin_unlock_irqrestore(
-				 &vfe_dev->common_data->common_dev_data_lock,
-				 flags);
-			return 0;
-		}
-
-		if (vfe_dev->reset_pending == 1) {
-			pr_err_ratelimited("%s:%d overflow %x during reset\n",
-				__func__, __LINE__, overflow_mask);
-			/* Clear overflow bits since reset is pending */
-			*irq_status1 &= ~overflow_mask;
-			spin_unlock_irqrestore(
-				 &vfe_dev->common_data->common_dev_data_lock,
-				 flags);
-			return 0;
-		}
-		pr_err_ratelimited("%s: vfe %d overflowmask %x,bus_error %x\n",
-			__func__, vfe_dev->pdev->id, overflow_mask, bus_err);
-		for (i = 0; i < axi_data->hw_info->num_wm; i++) {
-			if (!axi_data->free_wm[i])
-				continue;
-			ISP_DBG("%s:wm %d assigned to stream handle %x\n",
-				__func__, i, axi_data->free_wm[i]);
-		}
-		vfe_dev->recovery_irq0_mask = vfe_dev->irq0_mask;
-		vfe_dev->recovery_irq1_mask = vfe_dev->irq1_mask;
-		vfe_dev->hw_info->vfe_ops.core_ops.set_halt_restart_mask(
-				vfe_dev);
-		vfe_dev->hw_info->vfe_ops.axi_ops.halt(vfe_dev, 0);
-		/* mask off other vfe if dual vfe is used */
-		if (vfe_dev->is_split) {
-			int other_vfe_id;
-			struct vfe_device *temp_vfe;
-
-			other_vfe_id = (vfe_dev->pdev->id == ISP_VFE0) ?
-				ISP_VFE1 : ISP_VFE0;
-			temp_vfe = vfe_dev->common_data->dual_vfe_res->vfe_dev[
-					other_vfe_id];
-
-			atomic_set(&temp_vfe->error_info.overflow_state,
-				OVERFLOW_DETECTED);
-			temp_vfe->recovery_irq0_mask = temp_vfe->irq0_mask;
-			temp_vfe->recovery_irq1_mask = temp_vfe->irq1_mask;
-			temp_vfe->hw_info->vfe_ops.core_ops
-				.set_halt_restart_mask(temp_vfe);
-			temp_vfe->hw_info->vfe_ops.axi_ops.halt(temp_vfe, 0);
-		}
-
-		/* reset irq status so skip further process */
-		*irq_status0 = 0;
-		*irq_status1 = 0;
-
-		if (atomic_read(&vfe_dev->error_info.overflow_state)
-			!= HALT_ENFORCED) {
-			memset(&error_event, 0, sizeof(error_event));
-			error_event.frame_id =
-				vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id;
-			error_event.u.error_info.err_type =
-				ISP_ERROR_BUS_OVERFLOW;
-			msm_isp_send_event(vfe_dev,
-				ISP_EVENT_ERROR, &error_event);
-		}
-		spin_unlock_irqrestore(
-			&vfe_dev->common_data->common_dev_data_lock,
-			flags);
-		return 1;
-	}
-	return 0;
-}
-
-void msm_isp_reset_burst_count_and_frame_drop(
-	struct vfe_device *vfe_dev, struct msm_vfe_axi_stream *stream_info)
-{
-	if (stream_info->state != ACTIVE ||
-		stream_info->stream_type != BURST_STREAM) {
-		return;
-	}
-	if (stream_info->num_burst_capture != 0)
-		msm_isp_reset_framedrop(vfe_dev, stream_info);
-}
-
-void msm_isp_prepare_irq_debug_info(struct vfe_device *vfe_dev,
-	uint32_t irq_status0, uint32_t irq_status1)
-{
-
-	unsigned long flags;
-	struct msm_vfe_irq_debug_info *irq_debug;
-	uint8_t current_index;
-
-	spin_lock_irqsave(&vfe_dev->common_data->vfe_irq_dump
-		.common_dev_irq_dump_lock, flags);
-	/* Fill current VFE debug info */
-	current_index = vfe_dev->common_data->vfe_irq_dump.current_irq_index %
-				MAX_VFE_IRQ_DEBUG_DUMP_SIZE;
-	irq_debug = &vfe_dev->common_data->vfe_irq_dump.irq_debug[
-			current_index];
-	irq_debug->vfe_id = vfe_dev->pdev->id;
-	irq_debug->core_id = smp_processor_id();
-	msm_isp_get_timestamp(&irq_debug->ts, vfe_dev);
-	irq_debug->irq_status0[vfe_dev->pdev->id] = irq_status0;
-	irq_debug->irq_status1[vfe_dev->pdev->id] = irq_status1;
-	irq_debug->ping_pong_status[vfe_dev->pdev->id] =
-		vfe_dev->hw_info->vfe_ops.axi_ops.get_pingpong_status(vfe_dev);
-	if (vfe_dev->is_split &&
-		(vfe_dev->common_data->dual_vfe_res->vfe_dev[
-			!vfe_dev->pdev->id])
-		&& (vfe_dev->common_data->dual_vfe_res->vfe_dev[
-			!vfe_dev->pdev->id]->vfe_open_cnt)) {
-		/* Fill other VFE debug Info */
-		vfe_dev->hw_info->vfe_ops.irq_ops.read_irq_status(
-			vfe_dev->common_data->dual_vfe_res->vfe_dev[
-				!vfe_dev->pdev->id],
-			&irq_debug->irq_status0[!vfe_dev->pdev->id],
-			&irq_debug->irq_status1[!vfe_dev->pdev->id]);
-		irq_debug->ping_pong_status[!vfe_dev->pdev->id] =
-			vfe_dev->hw_info->vfe_ops.axi_ops.get_pingpong_status(
-				vfe_dev->common_data->dual_vfe_res->vfe_dev[
-					!vfe_dev->pdev->id]);
-	}
-	vfe_dev->common_data->vfe_irq_dump.current_irq_index++;
-	spin_unlock_irqrestore(&vfe_dev->common_data->vfe_irq_dump
-			.common_dev_irq_dump_lock, flags);
-}
-
-void msm_isp_prepare_tasklet_debug_info(struct vfe_device *vfe_dev,
-	uint32_t irq_status0, uint32_t irq_status1,
-	struct msm_isp_timestamp ts)
-{
-	struct msm_vfe_irq_debug_info *irq_debug;
-	uint8_t current_index;
-	unsigned long flags;
-
-	spin_lock_irqsave(&vfe_dev->common_data->vfe_irq_dump
-			.common_dev_tasklet_dump_lock, flags);
-	current_index =
-		vfe_dev->common_data->vfe_irq_dump.current_tasklet_index %
-		MAX_VFE_IRQ_DEBUG_DUMP_SIZE;
-	irq_debug = &vfe_dev->common_data->vfe_irq_dump.tasklet_debug[
-			current_index];
-	irq_debug->vfe_id = vfe_dev->pdev->id;
-	irq_debug->core_id = smp_processor_id();
-	irq_debug->ts = ts;
-	irq_debug->irq_status0[vfe_dev->pdev->id] = irq_status0;
-	irq_debug->irq_status1[vfe_dev->pdev->id] = irq_status1;
-	irq_debug->ping_pong_status[vfe_dev->pdev->id] =
-		vfe_dev->hw_info->vfe_ops.axi_ops.get_pingpong_status(vfe_dev);
-	vfe_dev->common_data->vfe_irq_dump.current_tasklet_index++;
-	spin_unlock_irqrestore(&vfe_dev->common_data->vfe_irq_dump
-			.common_dev_tasklet_dump_lock, flags);
-}
-
-static void msm_isp_enqueue_tasklet_cmd(struct vfe_device *vfe_dev,
-	uint32_t irq_status0, uint32_t irq_status1,
-	uint32_t ping_pong_status, uint32_t dual_irq_status)
-{
-	unsigned long flags;
-	struct msm_vfe_tasklet_queue_cmd *queue_cmd = NULL;
-	struct msm_vfe_tasklet *tasklet;
-
-	if (vfe_dev->is_split)
-		tasklet = &vfe_dev->common_data->tasklets[MAX_VFE];
-	else
-		tasklet = &vfe_dev->common_data->tasklets[vfe_dev->pdev->id];
-
-	spin_lock_irqsave(&tasklet->tasklet_lock, flags);
-	queue_cmd = &tasklet->tasklet_queue_cmd[tasklet->taskletq_idx];
-	if (queue_cmd->cmd_used) {
-		pr_err_ratelimited("%s: Tasklet queue overflow: %d\n",
-			__func__, vfe_dev->pdev->id);
-		spin_unlock_irqrestore(&tasklet->tasklet_lock, flags);
-		return;
-	}
-	atomic_add(1, &vfe_dev->irq_cnt);
-	queue_cmd->vfeInterruptStatus0 = irq_status0;
-	queue_cmd->vfeInterruptStatus1 = irq_status1;
-	queue_cmd->vfe_pingpong_status = ping_pong_status;
-	queue_cmd->dualvfeInterruptstatus = dual_irq_status;
-	msm_isp_get_timestamp(&queue_cmd->ts, vfe_dev);
-	queue_cmd->cmd_used = 1;
-	queue_cmd->vfe_dev = vfe_dev;
-
-	tasklet->taskletq_idx = (tasklet->taskletq_idx + 1) %
-		MSM_VFE_TASKLETQ_SIZE;
-	list_add_tail(&queue_cmd->list, &tasklet->tasklet_q);
-	spin_unlock_irqrestore(&tasklet->tasklet_lock, flags);
-	tasklet_schedule(&tasklet->tasklet);
-}
-irqreturn_t msm_isp_process_irq_dual_sync(int irq_num, void *data)
-{
-	struct vfe_device *vfe_dev = (struct vfe_device *) data;
-	uint32_t ping_pong_status;
-	uint32_t dual_irq_status = 0;
-
-	if (vfe_dev->dual_vfe_sync_mode) {
-		vfe_dev->hw_info->vfe_ops.irq_ops.clear_dual_irq_status(
-				vfe_dev, &dual_irq_status);
-	}
-
-	if (dual_irq_status == 0) {
-		pr_err("%s: irq_num %d VFE%d dual_irq_status NULL\n",
-			__func__, irq_num, vfe_dev->pdev->id);
-		return IRQ_HANDLED;
-	}
-	ping_pong_status =
-		vfe_dev->hw_info->vfe_ops.axi_ops.get_pingpong_status(vfe_dev);
-
-	if (vfe_dev->hw_info->vfe_ops.irq_ops.preprocess_camif_irq) {
-		if (vfe_dev->dual_vfe_sync_mode)
-			vfe_dev->hw_info->vfe_ops.irq_ops.preprocess_camif_irq(
-			vfe_dev, dual_irq_status);
-	}
-	msm_isp_enqueue_tasklet_cmd(vfe_dev, 0, 0,
-					ping_pong_status, dual_irq_status);
-	return IRQ_HANDLED;
-}
-irqreturn_t msm_isp_process_irq(int irq_num, void *data)
-{
-	struct vfe_device *vfe_dev = (struct vfe_device *) data;
-	uint32_t irq_status0, irq_status1, ping_pong_status;
-	uint32_t error_mask0, error_mask1;
-	struct msm_vfe_hardware_info *hw_info;
-
-	vfe_dev->hw_info->vfe_ops.irq_ops.read_and_clear_irq_status(vfe_dev,
-			&irq_status0, &irq_status1);
-
-	if ((irq_status0 == 0) && (irq_status1 == 0)) {
-		ISP_DBG("%s: irq_num %d VFE%d irq_status0 & 1 are both NULL\n",
-			__func__, irq_num, vfe_dev->pdev->id);
-		return IRQ_HANDLED;
-	}
-
-	ping_pong_status =
-		vfe_dev->hw_info->vfe_ops.axi_ops.get_pingpong_status(vfe_dev);
-
-	hw_info = vfe_dev->hw_info;
-
-	/* Get the dual IRQ status in dual mode*/
-
-	if (vfe_dev->hw_info->vfe_ops.irq_ops.preprocess_camif_irq) {
-		if (!vfe_dev->dual_vfe_sync_mode)
-			vfe_dev->hw_info->vfe_ops.irq_ops.preprocess_camif_irq(
-				vfe_dev, irq_status0);
-	}
-	if (msm_isp_process_overflow_irq(vfe_dev,
-		&irq_status0, &irq_status1, 0)) {
-		/* if overflow initiated no need to handle the interrupts */
-		pr_err("overflow processed\n");
-		return IRQ_HANDLED;
-	}
-
-	vfe_dev->hw_info->vfe_ops.core_ops.get_error_mask(&error_mask0,
-			&error_mask1);
-	error_mask0 &= irq_status0;
-	error_mask1 &= irq_status1;
-	irq_status0 &= ~error_mask0;
-	irq_status1 &= ~error_mask1;
-	if ((error_mask0 != 0) || (error_mask1 != 0))
-		msm_isp_update_error_info(vfe_dev, error_mask0, error_mask1);
-
-	if ((irq_status0 == 0) && (irq_status1 == 0) &&
-		(!(((error_mask0 != 0) || (error_mask1 != 0)) &&
-		 vfe_dev->error_info.error_count == 1))) {
-		ISP_DBG("%s: error_mask0/1 & error_count are set!\n", __func__);
-		return IRQ_HANDLED;
-	}
-	msm_isp_prepare_irq_debug_info(vfe_dev, irq_status0, irq_status1);
-	msm_isp_enqueue_tasklet_cmd(vfe_dev, irq_status0, irq_status1,
-					ping_pong_status, 0);
-
-	return IRQ_HANDLED;
-}
-
-void msm_isp_do_tasklet(unsigned long data)
-{
-	unsigned long flags;
-	struct msm_vfe_tasklet *tasklet = (struct msm_vfe_tasklet *)data;
-	struct vfe_device *vfe_dev;
-	struct msm_vfe_irq_ops *irq_ops;
-	struct msm_vfe_tasklet_queue_cmd *queue_cmd;
-	struct msm_isp_timestamp ts;
-	uint32_t irq_status0, irq_status1, pingpong_status, dual_irq_status;
-
-	while (1) {
-		spin_lock_irqsave(&tasklet->tasklet_lock, flags);
-		queue_cmd = list_first_entry_or_null(&tasklet->tasklet_q,
-			struct msm_vfe_tasklet_queue_cmd, list);
-		if (!queue_cmd) {
-			spin_unlock_irqrestore(&tasklet->tasklet_lock, flags);
-			break;
-		}
-		list_del_init(&queue_cmd->list);
-		vfe_dev = queue_cmd->vfe_dev;
-		queue_cmd->cmd_used = 0;
-		queue_cmd->vfe_dev = NULL;
-		irq_status0 = queue_cmd->vfeInterruptStatus0;
-		irq_status1 = queue_cmd->vfeInterruptStatus1;
-		pingpong_status = queue_cmd->vfe_pingpong_status;
-		dual_irq_status = queue_cmd->dualvfeInterruptstatus;
-
-		ts = queue_cmd->ts;
-		spin_unlock_irqrestore(&tasklet->tasklet_lock, flags);
-		if (vfe_dev->vfe_open_cnt == 0) {
-			pr_err("%s: VFE%d open cnt = %d, irq %x/%x\n",
-			__func__, vfe_dev->pdev->id, vfe_dev->vfe_open_cnt,
-			irq_status0, irq_status1);
-			continue;
-		}
-		atomic_sub(1, &vfe_dev->irq_cnt);
-		msm_isp_prepare_tasklet_debug_info(vfe_dev,
-			irq_status0, irq_status1, ts);
-
-		irq_ops = &vfe_dev->hw_info->vfe_ops.irq_ops;
-		irq_ops->process_reset_irq(vfe_dev,
-			irq_status0, irq_status1);
-		irq_ops->process_halt_irq(vfe_dev,
-			irq_status0, irq_status1);
-		if (atomic_read(&vfe_dev->error_info.overflow_state)
-			!= NO_OVERFLOW) {
-			ISP_DBG("%s: Recovery in processing, Ignore IRQs!!!\n",
-				__func__);
-			continue;
-		}
-		msm_isp_process_error_info(vfe_dev);
-		irq_ops->process_stats_irq(vfe_dev,
-			irq_status0, irq_status1, dual_irq_status,
-			pingpong_status, &ts);
-		irq_ops->process_axi_irq(vfe_dev,
-			irq_status0, irq_status1, dual_irq_status,
-			pingpong_status, &ts);
-
-		if (vfe_dev->dual_vfe_sync_mode) {
-			irq_ops->process_camif_irq(vfe_dev,
-				dual_irq_status, irq_status1, &ts);
-			/*
-			 * process the reg_update for pix from dual_irq_status
-			 * and RDI redupdate from individual VFEs
-			 */
-			irq_ops->process_reg_update(vfe_dev,
-				((irq_status0 & 0xE0) |
-				dual_irq_status),
-				irq_status1, &ts);
-			irq_ops->process_epoch_irq(vfe_dev,
-				dual_irq_status, irq_status1, &ts);
-		} else {
-			irq_ops->process_camif_irq(vfe_dev,
-				irq_status0, irq_status1, &ts);
-			irq_ops->process_reg_update(vfe_dev,
-				irq_status0, irq_status1, &ts);
-			irq_ops->process_epoch_irq(vfe_dev,
-				irq_status0, irq_status1, &ts);
-		}
-	}
-}
-
-int msm_isp_set_src_state(struct vfe_device *vfe_dev, void *arg)
-{
-	struct msm_vfe_axi_src_state *src_state = arg;
-
-	if (src_state->input_src >= VFE_SRC_MAX)
-		return -EINVAL;
-	vfe_dev->axi_data.src_info[src_state->input_src].active =
-	src_state->src_active;
-	vfe_dev->axi_data.src_info[src_state->input_src].frame_id =
-	src_state->src_frame_id;
-	return 0;
-}
-
-static void msm_vfe_iommu_fault_handler(struct iommu_domain *domain,
-	struct device *dev, unsigned long iova, int flags, void *token)
-{
-	struct vfe_device *vfe_dev = NULL;
-
-	if (token) {
-		vfe_dev = (struct vfe_device *)token;
-		vfe_dev->page_fault_addr = iova;
-		if (!vfe_dev->buf_mgr || !vfe_dev->buf_mgr->ops ||
-			!vfe_dev->axi_data.num_active_stream) {
-			pr_err("%s:%d buf_mgr %pK active strms %d\n", __func__,
-				__LINE__, vfe_dev->buf_mgr,
-				vfe_dev->axi_data.num_active_stream);
-			goto end;
-		}
-
-		mutex_lock(&vfe_dev->core_mutex);
-		if (vfe_dev->vfe_open_cnt > 0) {
-			pr_err_ratelimited("%s: fault address is %lx\n",
-				__func__, iova);
-			msm_isp_process_iommu_page_fault(vfe_dev);
-		} else {
-			pr_err("%s: no handling, vfe open cnt = %d\n",
-				__func__, vfe_dev->vfe_open_cnt);
-		}
-		mutex_unlock(&vfe_dev->core_mutex);
-	} else {
-		ISP_DBG("%s:%d] no token received: %pK\n",
-			__func__, __LINE__, token);
-		goto end;
-	}
-end:
-	return;
-}
-
-int msm_isp_open_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
-{
-	struct vfe_device *vfe_dev = v4l2_get_subdevdata(sd);
-	long rc = 0;
-
-	ISP_DBG("%s open_cnt %u\n", __func__, vfe_dev->vfe_open_cnt);
-
-	if (vfe_dev->common_data == NULL ||
-		vfe_dev->common_data->dual_vfe_res == NULL) {
-		pr_err("%s: Error in probe. No common_data or dual vfe res\n",
-			__func__);
-		return -EINVAL;
-	}
-
-	mutex_lock(&vfe_dev->realtime_mutex);
-	mutex_lock(&vfe_dev->core_mutex);
-
-	if (vfe_dev->vfe_open_cnt++) {
-		mutex_unlock(&vfe_dev->core_mutex);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		return 0;
-	}
-
-	vfe_dev->reset_pending = 0;
-	vfe_dev->isp_sof_debug = 0;
-	vfe_dev->isp_raw0_debug = 0;
-	vfe_dev->isp_raw1_debug = 0;
-	vfe_dev->isp_raw2_debug = 0;
-	vfe_dev->irq_sof_id = 0;
-	if (vfe_dev->hw_info->vfe_ops.core_ops.init_hw(vfe_dev) < 0) {
-		pr_err("%s: init hardware failed\n", __func__);
-		vfe_dev->vfe_open_cnt--;
-		mutex_unlock(&vfe_dev->core_mutex);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		return -EBUSY;
-	}
-
-	memset(&vfe_dev->error_info, 0, sizeof(vfe_dev->error_info));
-	atomic_set(&vfe_dev->error_info.overflow_state, NO_OVERFLOW);
-
-	vfe_dev->hw_info->vfe_ops.core_ops.clear_status_reg(vfe_dev);
-
-	vfe_dev->vfe_hw_version = msm_camera_io_r(vfe_dev->vfe_base);
-	ISP_DBG("%s: HW Version: 0x%x\n", __func__, vfe_dev->vfe_hw_version);
-	rc = vfe_dev->hw_info->vfe_ops.core_ops.reset_hw(vfe_dev, 1, 1);
-	if (rc <= 0) {
-		pr_err("%s: reset timeout\n", __func__);
-		vfe_dev->hw_info->vfe_ops.core_ops.release_hw(vfe_dev);
-		vfe_dev->vfe_open_cnt--;
-		mutex_unlock(&vfe_dev->core_mutex);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		return -EINVAL;
-	}
-
-	vfe_dev->hw_info->vfe_ops.core_ops.init_hw_reg(vfe_dev);
-
-	vfe_dev->buf_mgr->ops->buf_mgr_init(vfe_dev->buf_mgr,
-		"msm_isp");
-
-	memset(&vfe_dev->axi_data, 0, sizeof(struct msm_vfe_axi_shared_data));
-	memset(&vfe_dev->stats_data, 0,
-		sizeof(struct msm_vfe_stats_shared_data));
-	memset(&vfe_dev->error_info, 0, sizeof(vfe_dev->error_info));
-	memset(&vfe_dev->fetch_engine_info, 0,
-		sizeof(vfe_dev->fetch_engine_info));
-	vfe_dev->axi_data.hw_info = vfe_dev->hw_info->axi_hw_info;
-	vfe_dev->axi_data.enable_frameid_recovery = 0;
-	vfe_dev->vt_enable = 0;
-	vfe_dev->reg_update_requested = 0;
-	/* Register page fault handler */
-	vfe_dev->buf_mgr->pagefault_debug_disable = 0;
-	/* initialize pd_buf_idx with an invalid index 0xF */
-	vfe_dev->common_data->pd_buf_idx = 0xF;
-
-	cam_smmu_reg_client_page_fault_handler(
-			vfe_dev->buf_mgr->iommu_hdl,
-			msm_vfe_iommu_fault_handler,
-			NULL,
-			vfe_dev);
-	mutex_unlock(&vfe_dev->core_mutex);
-	mutex_unlock(&vfe_dev->realtime_mutex);
-	return 0;
-}
-
-#ifdef CONFIG_MSM_AVTIMER
-static void msm_isp_end_avtimer(void)
-{
-	msm_isp_stop_avtimer();
-}
-#else
-static void msm_isp_end_avtimer(void)
-{
-	pr_err("AV Timer is not supported\n");
-}
-#endif
-
-int msm_isp_close_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
-{
-	long rc = 0;
-	int wm;
-	int i;
-	struct vfe_device *vfe_dev = v4l2_get_subdevdata(sd);
-
-	ISP_DBG("%s E open_cnt %u\n", __func__, vfe_dev->vfe_open_cnt);
-	mutex_lock(&vfe_dev->realtime_mutex);
-	mutex_lock(&vfe_dev->core_mutex);
-
-	if (!vfe_dev->vfe_open_cnt) {
-		pr_err("%s invalid state open cnt %d\n", __func__,
-			vfe_dev->vfe_open_cnt);
-		mutex_unlock(&vfe_dev->core_mutex);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		return -EINVAL;
-	}
-
-	if (vfe_dev->vfe_open_cnt > 1) {
-		vfe_dev->vfe_open_cnt--;
-		mutex_unlock(&vfe_dev->core_mutex);
-		mutex_unlock(&vfe_dev->realtime_mutex);
-		return 0;
-	}
-	MSM_ISP_DUAL_VFE_MUTEX_LOCK(vfe_dev);
-	msm_isp_release_all_axi_stream(vfe_dev);
-	msm_isp_release_all_stats_stream(vfe_dev);
-
-	/* Unregister page fault handler */
-	cam_smmu_reg_client_page_fault_handler(
-		vfe_dev->buf_mgr->iommu_hdl,
-		NULL, NULL, vfe_dev);
-
-	rc = vfe_dev->hw_info->vfe_ops.axi_ops.halt(vfe_dev, 1);
-	if (rc <= 0)
-		pr_err("%s: halt timeout rc=%ld\n", __func__, rc);
-
-	vfe_dev->hw_info->vfe_ops.core_ops.update_camif_state(vfe_dev,
-		DISABLE_CAMIF_IMMEDIATELY);
-	vfe_dev->hw_info->vfe_ops.core_ops.reset_hw(vfe_dev, 0, 0);
-
-	/* put scratch buf in all the wm */
-	for (wm = 0; wm < vfe_dev->axi_data.hw_info->num_wm; wm++) {
-		msm_isp_cfg_wm_scratch(vfe_dev, wm, VFE_PING_FLAG);
-		msm_isp_cfg_wm_scratch(vfe_dev, wm, VFE_PONG_FLAG);
-	}
-	vfe_dev->hw_info->vfe_ops.core_ops.release_hw(vfe_dev);
-	/* after regular hw stop, reduce open cnt */
-	vfe_dev->vfe_open_cnt--;
-	vfe_dev->buf_mgr->ops->buf_mgr_deinit(vfe_dev->buf_mgr);
-	if (vfe_dev->vt_enable) {
-		msm_isp_end_avtimer();
-		vfe_dev->vt_enable = 0;
-	}
-	for (i = 0; i < VFE_SRC_MAX; i++)
-		vfe_dev->axi_data.src_info[i].lpm = 0;
-	MSM_ISP_DUAL_VFE_MUTEX_UNLOCK(vfe_dev);
-	vfe_dev->is_split = 0;
-	vfe_dev->dual_vfe_sync_mode = 0;
-
-	mutex_unlock(&vfe_dev->core_mutex);
-	mutex_unlock(&vfe_dev->realtime_mutex);
-	return 0;
-}
-
-void msm_isp_flush_tasklet(struct vfe_device *vfe_dev)
-{
-	unsigned long flags;
-	int i;
-	struct msm_vfe_tasklet_queue_cmd *queue_cmd, *q_cmd_next;
-	struct msm_vfe_tasklet *tasklet;
-
-	for (i = 0; i <= MAX_VFE; i++) {
-		if (i != vfe_dev->pdev->id &&
-			i != MAX_VFE)
-			continue;
-		tasklet = &vfe_dev->common_data->tasklets[i];
-		spin_lock_irqsave(&tasklet->tasklet_lock, flags);
-		list_for_each_entry_safe(queue_cmd, q_cmd_next,
-			&tasklet->tasklet_q, list) {
-			if (queue_cmd->vfe_dev != vfe_dev)
-				continue;
-			list_del_init(&queue_cmd->list);
-			queue_cmd->cmd_used = 0;
-		}
-		spin_unlock_irqrestore(&tasklet->tasklet_lock, flags);
-		tasklet_kill(&tasklet->tasklet);
-	}
-	atomic_set(&vfe_dev->irq_cnt, 0);
-
-}
-
-void msm_isp_irq_debug_dump(struct vfe_device *vfe_dev)
-{
-
-	uint8_t i, dump_index;
-	unsigned long flags;
-
-	spin_lock_irqsave(
-		&vfe_dev->common_data->vfe_irq_dump.common_dev_irq_dump_lock,
-		flags);
-	dump_index = vfe_dev->common_data->vfe_irq_dump.current_irq_index;
-	for (i = 0; i < MAX_VFE_IRQ_DEBUG_DUMP_SIZE; i++) {
-		dump_index++;
-	}
-	spin_unlock_irqrestore(
-		&vfe_dev->common_data->vfe_irq_dump.common_dev_irq_dump_lock,
-		flags);
-}
-
-
-void msm_isp_tasklet_debug_dump(struct vfe_device *vfe_dev)
-{
-
-	uint8_t i, dump_index;
-	unsigned long flags;
-
-	spin_lock_irqsave(
-	&vfe_dev->common_data->vfe_irq_dump.common_dev_tasklet_dump_lock,
-	flags);
-	dump_index = vfe_dev->common_data->vfe_irq_dump.current_tasklet_index;
-	for (i = 0; i < MAX_VFE_IRQ_DEBUG_DUMP_SIZE; i++) {
-		dump_index++;
-	}
-	spin_unlock_irqrestore(
-	&vfe_dev->common_data->vfe_irq_dump.common_dev_tasklet_dump_lock,
-	flags);
-}
-
-void msm_isp_dump_ping_pong_mismatch(struct vfe_device *vfe_dev)
-{
-
-	msm_isp_irq_debug_dump(vfe_dev);
-	msm_isp_tasklet_debug_dump(vfe_dev);
-}
+ÙıŸÛNwçN8çÍáÎ½ë~¹éî÷ëãŞ¸ëï½ë®½ëöİ­´ã¾táÍßmßMéşéÎıÑ­ŸÙ­´ã~ŸïNıïn½ë¾¼ï´ÛÎ·Ûİ´ßmôß]÷ÙİößMößMœÛNxëÎ¹ÛNëŞïüÛN:éşùéî¸ë^øëŞŸéíÛN5éÎœÛNöëŞ»ëÎøï}´ïn¹ï~¹ïnúë¸ÙíÛMšÑ­´Ù­´ç¼ëŞ÷ÛNôïnŸë¾öë^ÛN½ï}´ë®öë¹ÛN÷éşºïûë^öëÛÛNıéşùÛN·ë^ÛNöë¸ëŞ÷ïöëŞ¶ïøë´ëŞøÛNµéî¸ÙşŸïm´éŞŸë½ë®ıÑ­´Ù­´ëŞøÛNùéî¸ëöÛNøëÎ¹ÛNøëöéŞ÷ÛNŸë­´ï¼ë´ã¾ç´ã¾¹éî¹ïnµéÍ´çNùënœëŞ·ÛNëŞ·ëï~¹ÛNúëöï~½éşÛMöÛNµéî¸Ñ­´Ù­´éşéÎıÛNúëöï~½éşÛMöÛNµï}´ïNùënœëŞ÷ëÎ¹ë´ënıÛNøëÎ¹ÛN:ïn¹ë´ç~Ÿë®øï¾µïn¹ÛN:éşùéî¸ë^øëŞŸéíÑ­´Ù­ÛMšÛNxëÎ½ï}´ïNöéş»ïnµéİ´ëŞ÷ÛN¸ëŞ÷ïöëŞ¶ïøë¸ÛN½éí´ï¼ë´ëÎŸïN¹ÛNøëÎµï´ëŞøÛNûëŞœéÍ´ën¹ÛNùï~¹ë®ùéÍœÑ­´Ù­´ënùï´ç¾=ç<áşyç´ã^çİ´ç¾5çnvã^ç}İ½´ï¾½ï¼éşùï´ëúëÛNøëÎ¹ÛN½éŞôéÎ½ë¸ÛNûë^öïnµéîøïİ´éşºÑ­´Ù­´áŞ9çn7ãÎ5áîxã^6ãŞãŞxçİ´éşöÛN:ãŞxáî9ç~wÛN:áşvÛN5ÛNtã^vç=ã~yáÎ5çm´çNyçntáşwãÛM´ç~¹ë´ï¼ëÛMšÛN;áîyÛN;ëëöë^œÛNtï¶éÎ½ë}´áÎ½ë~¹éî÷ë´ë®Ÿïm´éŞŸïn¹ÛN¸ëøë^½éÎ÷ÙíÛMšÙıÛ~½éî·éÎùë¹ÛMÜéÎ½éîùïÍŸéŞùï¹ïÍëÍŞÑ­·ëŞë~œï¸ë´İÎœëŞïüÙş½éıëÍŞÑ­·ëŞë~œï¸ë´İÎë¸ëŞµÙşúßœßmï~ùën¸ëúÙî¼İíÛ~½éî·éÎùë¹ÛMÜéÎ½éîùïÍŸïnµï¹éÎ½éŞ½ïëÍŞÑ­Û~½éî·éÎùë¹ÛM¶éŞ÷éİëÍ¶Ñ­·ëŞë~œï¸ë´Ûnï~åş½ï~ôåşùï½éÍëÍ¶Ñ­·ëŞë~œï¸ë´Ûnï~åş½ï~ôåşµïÎ½åşùï½éÍëÍ¶Ñ­·ëŞë~œï¸ë´Ûnï~åş½ï~ôåş÷ïµï÷åşùï½éÍëÍ¶Ñ­·ëŞë~œï¸ë´Ûnï~åş·ë^ëöë^_ëŞŸåşùï½éÍëÍ¶Ñ­·ëŞë~œï¸ë´Ûn·ë^åş÷éŞï_ë^ôëİëÍ¶Ñ­·ëŞë~œï¸ë´Ûnï~åş½ï~ôßüÙî¼ÛmÑ­·ëŞºéî¸ëºÛNyãŞçõß®_áŞ5çÍÛ~¸ëºëŞë´ç=áîxß]úåşã^|ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM¼ß­ùß÷ßyÛİÛ~¹éî¸ëŞºÑ­Û~¸ëºëŞë´áŞ5çÎ_ãŞwçN_ç­øéÍöåş9ç®9áîxç}´ß]ôßMÛ~¸ëºëŞë´áŞ5çÎ_ãŞwçN_çn9ã¾_áÎ=ç~xÛMõßMôÑ®÷ïµï½ë}´ã9ã®=áî9åşçxã|ÛÎ¶ë^ëûëŞ¸ï¼åşë¾öåşïøëüÛİÛÑ®÷ïµï½ë}´ï~øïnùë~øÛNï~åş½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öİ½Ñ­·ë¹ë®½éî¹ÛNç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİ´í½´åÍÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞëŞ÷åş÷ïNœëŞøÛMºÛ­´ï®ºë_ë¹ï­İîôë¹ï­İî½ë´İİİÛN=ç~tåşzã®9ßM½ÛNÛÛN\Ñ­=ÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºëõåş¸ëúÛMİÛNúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İí´åÍÓİ=Óİ=ÓŞ¸ïµéÎ_ï®ºë_ïn¹ï}İîúë®¹åş¸ëúå¾=ç~tåşzã®9ß^]İ½´åÍÓİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºëõåş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÛN\Ñ­=íİ´åÍíİÑ­·ë¹ë®½éî¹ÛNç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİ´í½´åÍÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞëŞ÷åş÷ïNœëŞøÛMºÛ­´ï®ºë_ë¹ï­İîôë¹ï­İî½ë´İİİÛN=ç~tåşzã®9ßM½ÛNÛÛN\Ñ­=ÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºëõåş¸ëúÛMİÛNúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İí´åÍÓİ=Óİ=ÓŞ¸ïµéÎ_ï®ºë_ïn¹ï}İîúë®¹åş¸ëúå¾=ç~tåşzã®9ß^]İ½´åÍÓİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºëõåş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÛN\Ñ­=íİ´åÍíİÑ®÷ïµï½ë}´ï½éîøß­øåşøÛNï~åş½ï~ôåş·ïNôåş·éÎ›åşöë^øëÛÑ­Û~¸ëºëŞë´ç®:ãøßN_ßÍıß½øç­öåşzãvç~=áşÛMôïÍõßMôß]ôßMõã]Ñ®úéş½ë´éŞ÷éŞ_ëŞ÷ïN_ïNöëŞï_ë®Ÿïöë~·åş¹ïnöéşöÛÎ·éşï~øÛN·ëÎµïm´Ù®Ÿïn½ë¾½éíœÛNùëŞï÷ßn_ï´ë®Ÿïöë~·åşºéşöéŞµï½Ñ®ÛÑ­=ëŞï´ëİÛÑ­=ë~¼ë^öÛNøëüï[ß]İ½Ñ­=ï¹ïÎøå½øåİ´İİ´Û¾\ßM»İ½ÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛMøİ½´ëİ›Ù½½ÛNÛÑ­=ÓŞøëüï[ëŞ]ÛMİÛM¼ë~¼ë^öÛİ¼ÛÍ¼ë®Ÿïöë~·åşºéşöéŞµï½ÛMŞİí´ÛÎ½ÛMšÛMüÛİ½ÛMºÛMôïÎ:ã­½İ½Óİ=ëŞºÛM¼ÛÎøëüï[ëŞ]ÛMÜÛM»ßM»Ûİ´íÎÜÛM¼ï¹ïÎøå¾½åİ´İí´Û¾ÚÛ½½Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN=éîúë^œëŞ¸ÛNŸïøïNùï´ë®Ÿïnë^øÛM¹ë´ÛÎùéîôïn½éîøë^¶éÎ¹ÛŞ\éí¶ÙÍÓİ=Óİ=éşöëŞ»ëŞÙÍ´ë®Ÿïöë~·åşºéşöéŞµï½İ½Óİ=ÓŞöëøïöéíÛÑ­=ÓŞİÑ­=íİÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN=éîúë^œëŞ¸ÛNŸïøïNùï´ë®Ÿïnë^øÛM¹ï~\éí¶ÙÍÓİ=éşöëŞ»ëŞÙÍ´ï¹ïÎøÛİÛÑ®İÑ­ëŞï´éŞ÷éŞ_ëŞ÷ïN_ëŞëŞøåş¶ë^ëûëŞ¸ï¼åşë¾öÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÑ­=Óİ=ëïÛNï~åş½ï~ôåş¼ï¾_ë~œëŞ¹éîøÛN·éÎ½ëï½Ñ®ÛÑ­=ëŞï´ïn·ÛMİÛMôİ½Ñ­=éŞùï¹ïÎ_éÎŸë~›ÛÍºënµéî¸ï¾½ëøëÎ_éŞ»ïn_éŞùï¹ïÍ½İ½ÓŞ½ë­´ÛÎ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾·éÎ½ëï]Ùîµë~øëŞúë½ÛNÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®¶ë^ëûëŞ¸ï¼åşë¾öåşïøëüÛİÛÑ­=ÓŞöëøïöéí´ïn·İ½ÓŞİÑ­=ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmë~œëŞ¹éîøåş½éîºéş[ë~œëŞ¹éîøåİë^·ï½ï®¹ÛMİÛMõİ½ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙîùï~¹åş·éşùéîøÙ½›İ½ÓŞ½ë­´ÛÎúë®¹åş¸ëúÛMºÛ­´Û^½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî¶ï÷åş·éÎ½ëï½ÛNÛÑ­=ÓŞöë}´İİ´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ïNœë^øë®ŸïnåşŸïN÷Ùî½éî½ï_ënûåşë¾öÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=Û®½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÛİÛÑ­=ÓŞ½ë­´ÛÍµïn·Ûİ´í½Óİ=ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙîùïN¸ë^øë_ënûÛMİÑ­=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ïNœë^øë®ŸïnåşŸïN÷ÙîùïN¸ë^øë_ënûİ½Óİ=ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî¸ë½éî½ï_ënûåşë¾öÛMİÑ­=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ïNœë^øë®ŸïnåşŸïN÷Ùî¸ë½éî½ï_ënûåşë¾öİ½Óİ=íİÓŞİÑ­=ëŞºÛM¼ïn·Ûİ´í½Óİ=ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmï÷ë_ë~ŸïïÙİÛÑ­=ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾·éÎ½ëï]Ùîµë~øëŞúë´İİ´ßMÛÑ­=íİÑ­=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºënµéî¸ï¾½ëøëÎ_éŞ»ïn_éŞùï¹ïÍ½İ½ÓŞöëøïöéí´ïn·İ½íİÑ®½éîøÛNï~åş½ï~ôåşùïN¸ë^øë_ënµéî¸ï¾½ëøëÍ¼ëïÛNï~åş½ï~ôåş¼ï¾_ë~œëŞ¹éîøÛN·éÎ½ëïœÑ­=ï½éîøß­øåşøÛNµëmœÛNùëŞïúß_ï´ëŞ¶Ûİí½ÓŞ½éîøÛNöë}ÛÑ­ÓŞïøëüåşœéş·é½¼Û®¶ë^ëûëŞ¸ï¼åşë¾öåşïøëüÛİÛÑ­=ëŞºÛM¼Û^½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙîùï~¹åş·éşùéîøÛNÜíÍÓİ=Û^½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî¶ï÷åş·éÎ½ëï½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚëöïnŸïm´ënµéî¸ï¾½ëøëÍ´éŞµéîµë¾¹ïm´ëŞë^·ï½ï®¹ÛNùï~¹åş·éîøİ­¹ë´ënùï~_ë~œéîøİ­¹ë\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åıœÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙîùï~¹åş·éşùéîøÙÍÓİ=ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî¶ï÷åş·éÎ½ëï½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºënµéî¸ï¾½ëøëÎ_éŞ»ïn_éŞùï¹ïÍ½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾·éÎ½ëï]Ùîµëm´İİ´ë^¶İ½ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾·éÎ½ëï]Ùî½ëm´İİ´ëŞ¶İ½ÓŞöë}´İİ´ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmïôëµï¹åş¶ï½¼Û®½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÛİÛÑ­=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºënµéî¸ï¾½ëøëÎ_éŞ»ïn_éŞùï¹ïÍ½İ½ÓŞöëøïöéí´ßMÛÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåş¸ë½éî½ï_ënµéî¸ï¾½ëøëÎ_éŞ»ïm¼ëïÛNï~åş½ï~ôåş¼ï¾_ë~œëŞ¹éîøÛN·éÎ½ëï½Ñ®ÛÑ­=ëŞºÛM¼ë~œëŞ¹éîøÛMŞİİ´áŞ5çÎ_ãŞwçN_ã~ãŞ9áîxÛİ´í½Óİ=ïNöåş¹ïnöÛÍ¶ëŞï®µéÎ½ë´ã~œëŞ¹éîøÛN½ë´Û¸åÎÛmœÛN·éÎ½ëï½İ½Óİ=ïn¹ïùïnİ½ÓŞİÑ­=éŞùï¹ïÎ_éÎŸë~›ÛÍºënµéî¸ï¾½ëøëÎ_éŞ»ïn_éŞùï¹ïÍ½İ½ÓŞëï~¹ï¼Û®½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾·éÎ½ëï]ÙÍ´ßMœÑ­=Óİ=ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_ëŞë®ŸÛİ½İ½ÓŞ½ë­´ÛÎ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙîùï~¹åş·éşùéîøÛİ´í½Óİ=ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmï÷ë_ë~ŸïïÙİÛÑ­=ÓŞ½ë­´ÛÎ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙîùï~¹åş·éşùéîøÛİ´í½Óİ=ÓŞïøëüåşùéîœéş·é½¼Û®¶ë^ëûëŞ¸ï¼åşë¾öåşïøëüÛİÛÑ­=Óİ=ïn¹ïùïnİ½Óİ=íİÑ­=ÓŞ½ë­´ÛÍµëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmënùï~_ë~œëŞ¹éîøÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛN¹ïnöéşöİ­´ënùï}´ë~œëŞ¹éîøÛN½éîúë^œëŞ¸åÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åı½İ½Óİ=ÓŞïøëüåşùéîœéş·é½¼Û®¶ë^ëûëŞ¸ï¼åşë¾öåşïøëüÛİÛÑ­=Óİ=ïn¹ïùïnİ½Óİ=íİÑ­=ÓŞ½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî¸ë½éî½ï_ënûåşë¾öÛÍÓİ=Óİ=Û®½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÛİÛÑ­=íİÓŞïøëüåşùéîœéş·é½¼Û®¶ë^ëûëŞ¸ï¼åşë¾öåşïøëüÛİÛÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåşùï½éÎ_ë¾¹ï_ënµéî¸ï¾½ëøëÎ_ï~øë^øï}¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓİ=Óİ=ÛM´ÛM´ÛM´ï~øïnùë~øÛNï~åş½ï~ôåş÷ïµï½ï~øëŞ·ï}´Ù®÷ïµï÷Ûİí½ÓŞ÷ïµï÷ÙİŞëŞ÷ïN_ï®ºëôåşµë~øëŞúë´İİ´ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmë~œëŞ¹éîøåş½éîºéş[ãŞwçN_ç®:ãôåİë^·ï½ï®¹İ½ÓŞ÷ïµï÷ÙİŞëŞ÷ïN_ï®ºëôåşµëm´İİ´ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmë~œëŞ¹éîøåş½éîºéş[ãŞwçN_ç®:ãôåİë^¶İ½ÓŞ÷ïµï÷ÙİŞëŞ÷ïN_ï®ºëôåş½ëm´İİ´ëŞ÷ïN_ënµéî¸ï¾½ëøëÎ_éŞ»ïmë~œëŞ¹éîøåş½éîºéş[ãŞwçN_ç®:ãôåİëŞ¶İ½Ñ­=ï~øë^øï}İî½ï~ôåşúë®¹ß^_ë^·ï½ï®¹ÛMİÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾=ç~tåşzã®9ß^]Ùîµë~øëŞúëÛÑ­=ï~øë^øï}İî½ï~ôåşúë®¹ß^_ë^¶ÛMİÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾=ç~tåşzã®9ß^]ÙîµëmÛÑ­=ï~øë^øï}İî½ï~ôåşúë®¹ß^_ëŞ¶ÛMİÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾=ç~tåşzã®9ß^]Ùî½ëmÛÑ­ÓŞ÷ïµï÷ÙİŞëŞ÷ïN_ë~ôïN_ë^·ï½ï®¹ÛMİÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾=ç~tåş7çNtåİë^·ï½ï®¹İ½ÓŞ÷ïµï÷ÙİŞëŞ÷ïN_ë~ôïN_ë^¶ÛMİÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾=ç~tåş7çNtåİë^¶İ½ÓŞ÷ïµï÷ÙİŞëŞ÷ïN_ë~ôïN_ëŞ¶ÛMİÛN½ï~ôåş¶ë^ëûëŞ¸ï¼åşë¾öÙî·éÎ½ëï_ëŞë®Ÿå¾=ç~tåş7çNtåİëŞ¶İ½ÓŞ÷ïµï÷ÙİŞéÎµï~øåşŸï®¹ïnºéÎŸï¾_ë^¶ÛMİÛNúë®¹åş¸ëúÙİŞéŞ÷éŞ_ëŞ÷ïN_éÎµï~øåşŸï®¹ïnºéÎŸï¾_ë^¶İ½ÓŞ÷ïµï÷ÙİŞéÎµï~øåşŸï®¹ïnºéÎŸï¾_ëŞ¶ÛMİÛNúë®¹åş¸ëúÙİŞéŞ÷éŞ_ëŞ÷ïN_éÎµï~øåşŸï®¹ïnºéÎŸï¾_ëŞ¶İ½ÓŞ÷ïµï÷ÙİŞï®ºë_ë~œé¾_ïnµï¹ÛMİÛNúë®¹åş¸ëúÙİŞï®ºë_ë~œé¾_ëŞë®Ÿå½Óİ=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_ë~œé¾_ëŞ¸ïÎ]Ùî·éÎ›åşöë^øëÛÑ­=ï~øë^øï}İî·ïNôåş·éÎ›åşöë^øë´İİ´éŞ÷éŞ_ëŞ÷ïN_ë~ôïN_ë~œé¾_ïnµï¹İ½íİÑ®úéş½ë´éŞ÷éŞ_ëŞ÷ïN_ïøëŞœåşùïN¸ë^øë_ë~œé¾_ïnµï¹ÛÎœéşë½´ë~œéş·é¾_ïnµï¹Ûİí½ÓŞï~åş½ï~ôåş·ïNôåş·éÎ›åşöë^øë´İİ´ë~œéş·é¾_ïnµï¹İ½íİÑ®ùëŞï÷ßn_ï´éŞ÷éŞ_ëŞ÷ïN_ë¾¹ï_ë®öë^ë¸ïnŸïN_ïN¹ïn½éş¸ÛÍÓŞ¹éîùéİ´éŞ÷éŞ_ï®ºë_ë®öë^ë_ï~›ëŞôåşôë^øï¹ïnÛNºïnµéŞ¹åş÷é¾½ïN_ïNµïøëöéí½Ñ®ÛÑ­=ï~ûëŞøë~¼ÛM¼ë®öë^ë_ï~›ëŞôåşôë^øï¹ïnÛİ´í½ÓŞ·ë^÷ë´áîåşwá¾=çMÚÑ­=ë~µï~¹ÛN9ç®9çn}åıöã®vã^ãÚÑ­=ë~µï~¹ÛN9ç®9çn}åı÷ã®vã^ãÚÑ­=ë~µï~¹ÛN9ç®9çn}åıøã®vã^ãÚÑ­=ë~µï~¹ÛN9ç®9çn}åıùã®vã^ãÚÑ­=ë~µï~¹ÛN9ç®9çn}åıúã®vã^ãÚÑ­=ë~µï~¹ÛN9ç®9çn}åıûã®vã^ãÚÑ­=ë~µï~¹ÛN9ç®9çn}åıüã®vã^ãÚÑ­=ÓŞöëøïöéí´ë®öë^ë_ï~›ëŞôåşôë^øï¹ïnÛM›ÛMõİ½ÓŞ·ë^÷ë´ãzãvçŞ_ß]úã®vã^ãÚÑ­=ÓŞöëøïöéí´ß]úİ½ÓŞ·ë^÷ë´ãzãvçŞ_ß}öã®vã^ãÚÑ­=ÓŞöëøïöéí´ß}öİ½ÓŞ·ë^÷ë´ç~ãŞtåş5áÎİ­Óİ=ïn¹ïùïnÛNwá¾=çN_ã^áÍÛÑ­=ë¹ë®µïœïÚÑ­=ÓŞöëøïöéí´ß]ÛÑ­=íİÓŞöëøïöéí´ß]ÛÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåş»ëøåşøëŞë÷ïµéŞôÛÎ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ï½éŞ¹ï~øë^ïM´Ù®øëŞë_ï~øë^ïMœÑ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛİí½ÓŞ÷ïöï·ï´ï½éŞ¹ï~ôë·ÛNøï}ÛÑ­ÓŞ¸éş_ë¾¹ïøëŞëŸë®¸ë^ıÛÍºÛÎøëŞë_ï~øë^ïMİî¹ï®¹éîøåşøëŞë½ÛİÛÑ­=ëŞºÛM¼ï®ºë_ë¹ï­İîúï_ëë^¶éÎ¹Ûİ´í½Óİ=éŞ÷éŞ_ëŞ÷ïN_ë¾¹ï_ë^úï½éŞ¹ïn_ï÷ÛÎøëŞë_ï~øë^ïM½İ½Óİ=ï½éŞ¹åş÷ïµéŞôÙİŞënùë®_ï½éŞ¹Ùîøï®_ï~¹ë}´ÛM´ÛMİÛNøëŞë_ï~øë^ïMİîúï_ï½éŞ¹Ùîøï®_ï~¹ë}ÛÑ­=ÓŞøëŞë_ï~øë^ïMİî¶ïºåşøëŞëïúåşùï~¹ë}´ÛM´İİ´ï½éŞ¹åş÷ïµéŞôÙİŞï®øåşøëŞëïúåşùï~¹ë}ÛÑ­=íİ´ëœï~¹ÛNÛÑ­=ÓŞ»ëøåşéşéşøéşëŞ·åş¶éşŸïøëŞë¼Û®øï}½İ½Óİ=ï½éŞ¹åş÷ïµéŞôÙİŞënùë®_ï½éŞ¹Ùîøï®_ï~¹ë}´ÛM´ÛMİÛNøï}ïúåş÷ë·İ½Óİ=ï½éŞ¹åş÷ïµéŞôÙİŞënùë®_ï½éŞ¹Ùîøï®_ï÷ë·ÛM´ÛMİÛNøï}ïúåşï~¹ë}Ÿß]ôßMôİ½Óİ=ï½éŞ¹åş÷ïµéŞôÙİŞënùë®_ï½éŞ¹åşï}´ÛM´ÛM´ÛM´ÛMİÑ­=Óİ=ÛÍ¼ï½éîøß­øåşøÛŞøï}ïúåş÷ë·ÛMšÛMõßMôßMôßMôßMôßM½ÛM›ÛNøï}ïúåşï~¹ë}ÛÑ­=íİíİÑ®÷ïµï½ë}´ëŞéÎ½éî¹ÛNùß}öÛNï~åş½ï~ôåş¹ï®øåşë^÷é¾_ïŸåş½ï~ôåş¹ï®¹éîøÛÎùß}öÛN¹ï®øåşë^÷é½½Ñ®ÛÑ­=ï÷ßm´ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåşwç6ç~_áŞ5ç~åşáşãÛÑ­ÓŞ÷ï¾½ï·ëÍ´ÛÎ¹ï®øåşë^÷é½½ÛNÛÑ­=ë~µï~¹ÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ç~xã^xç~_áîç=ã®}İ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåşwç5çwåşáşxãŞ:çİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åş9çnváşvİ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåş9çnváşvİ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ãŞáŞç_çN_ã®5ççÚÑ­=ÓŞ¹ï®øåş½ë´İİ´ãŞwçN_ãzãç_ãŞáŞç_çN_ã®5ççÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åşwçvã5áŞ_çtã5ç9åş8áşãÚÑ­=ÓŞ¹ï®øåş½ë´İİ´ãŞwçN_ãzãç_ç~xçn9ã^åşyçN8ã^xã_ãáî9İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_çn9ã¾_çtã5ç9İ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåşvã;åşyçN8ã^xãÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åşwáş:İ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåşwáş:İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ãnyã®_ã=ç®9çnxİ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåş6ç:åş8ãŞzãvçÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åş6ç:åş8áşãÚÑ­=ÓŞ¹ï®øåş½ë´İİ´ãŞwçN_ãzãç_ãnyã®_ãáî9İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ã~áŞtåşwç5çwåşáşxãŞ:çİÚÑ­=ÓŞ¹ï®øåş½ë´İİ´ãŞwçN_ãzãç_ã~áŞtåşwç5çwåşáşxãŞ:çİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åşã^wá¾_ã®9åşvã5ã_ãáî9İ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåş:ã_çn9ã^8åş8áşãÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åştãŞã¾_çNáî;åşãŞwáŞ5ç7ãÍÚÑ­=ÓŞ¹ï®øåş½ë´İİ´ãŞwçN_ãzãç_çN=áî;åştáşã¾_áŞ=ç~ã^xã~<İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_çn9ã¾_çtã5ç9åşãŞwç~=áî;İ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåşvã;åşyçN8ã^xã_áŞ=ç~wãŞã½ÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åş6ç:åş:ã^xã^åş9çnváşvİ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåş6ç:åş:ã^xã^åş9çnváşvİ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ç~ã®_çtã5ç9åşã^áşwã7İ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåşwáş:åşyçN8ã^xã_áî5áîç~9ã}ÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ¸ëºë^ùéÎøİ­Óİ=ëúï_ëŞ¸ÛMİÛN=ç~tåş9ç®9áîxåşwç6ç~_áŞ5ç~åşáşãÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­ÓŞöëøïöéí´ëúï_ëŞ¸İ½íİÑ®÷ïµï½ë}´ëŞéÎ½éî¹ÛN½éîøÛNï~åş½ï~ôåş÷ï¶ï~·ïn½ën¹åş¹ï®¹éîøåşë^÷é½¼ï~øïnùë~øÛNúßœßn_ë®¼ÛMšë®¼ÙÍÓİ=ï~øïnùë~øÛNúßœßn_ëúëï_ï~ùën÷ë~öëŞôï½éşÛMšï~ùëmœÛN½éîøÛN¹ï®øåşë^÷é¾_ëŞë¹ïÍœÑ­=ÓŞùß}öÛN¹ï®øåş½ëœÛN¶éşŸéÍ´ï~ùën÷ë~öëŞ¶ë_ë®œë^»Ûİí½ÓŞ½éîøÛNöë}´İİ´ßMœÛN½ÙÍ´ëŞï¹ïnºë^·ëÛÑ­ÓŞ½ë­´ÛÎ¹ï®øåşë^÷é¾_ëŞë¹ïÍ´İİİÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ç~xã^xç~_áîç=ã®}Ûİ´í½Óİ=ë®Ÿïm´ÛÎ½ÛMİÛMôİ½´ëİ´İÍ´áŞwáŞ_ãŞwçN_ç~xã^xç~_áŞ5çÍÛÛN½Ù½›Ûİ´í½Óİ=ÓŞ÷ï¶ÙİŞïıïN¹ÛMİÛN¹ï®øåş½ë´Ù½´ëİÛÑ­=Óİ=ëŞºÛM¼ï~ùën÷ë~öëŞ¶ë_ë®œë^»ÛİÓİ=Óİ=ïn·ÛMİÛNúßœßn_ëúëï_ï~ùën÷ë~öëŞ¶ë¼ë®¼ÙÍ´ï~ùëmœÑ­=Óİ=Óİ=áŞ5çÎ_ãŞwçN_ç­øéÍöåş9ç®9áîxç}œÛNçáÍ½İ½Óİ=ÓŞ¹éÎ÷ëÓİ=Óİ=ïn·ÛMİÛNúßœßn_ëúëï_ïï~ùën÷ë~öëŞ¶ë¼ë®¼ÙÍ´ï~ùëm½İ½Óİ=ÓŞ½ë­´ÛÎöë}´Û]İÛMôÛİ´í½Óİ=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ç~ùën÷ÛN¹ï®¹éîøåşøïŞôë´İİôïÍ¹ïÍ´ë®µëŞœë¸åÎÛmœÑ­=Óİ=Óİ=åş_ë®ùéî·åş_ÙÍ´ï~ùëmİîøïŞôë½İ½Óİ=Óİ=ïn¹ïùïnÛNöë}ÛÑ­=Óİ=íİÓİ=íİÓŞİÛN¹éÎ÷ë´ëŞºÛM¼ëúï_éŞµï~›åş½éî¸ëüÛMİİİ´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åşwáş:ÛNÜíÍÓİ=ÛM´ÛN¹ï®øåşë^÷é¾_ëŞë¹ïÍ´İİİÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ç~ã®_çtã5ç9åşã^áşwã7ÛNÜíÍÓİ=ÛM´ÛN¹ï®øåşë^÷é¾_ëŞë¹ïÍ´İİİÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_çn9ã¾_çtã5ç9ÛNÜíÍÓİ=ÛM´ÛN¹ï®øåşë^÷é¾_ëŞë¹ïÍ´İİİÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ç~xçn9ã^åşyçN8ã^xã_ãáî9Ûİ´í½Óİ=ë®Ÿïm´ÛÎ½éîøëöë®µë~¹ÛMİÛMôİ½´ëŞï¹ïnºë^·ë´İÍ´ç®:ã_ç~vã~_áŞ5çÍÛÛN½éîøëöë®µë~¹Ù½›Ûİ´í½Óİ=ÓŞ÷ï¶ÙİŞïıïN¹ÛMİÛN¹ï®øåş½ë´íÍ´ëŞï¹ïnºë^·ëÛÑ­=Óİ=ëŞºÛM¼ï~ùën÷ë~öëŞ¶ë_ë®œë^»ÛİÓİ=Óİ=ïn·ÛMİÛNúßœßn_ëúëï_ï~ùën÷ë~öëŞ¶ë¼ë®¼ÙÍ´ï~ùëmœÑ­=Óİ=Óİ=áŞ5çÎ_ãŞwçN_ç­øéÍöåş9ç®9áîxç}œÛNçáÍ½İ½Óİ=ÓŞ¹éÎ÷ëÓİ=Óİ=ïn·ÛMİÛNúßœßn_ëúëï_ïï~ùën÷ë~öëŞ¶ë¼ë®¼ÙÍ´ï~ùëm½İ½Óİ=ÓŞ½ë­´ÛÎöë}´Û]İÛMôÛİ´í½Óİ=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ç~ùën÷ÛN¹ï®¹éîøåşøïŞôë´İİôïÍ¹ïÍ´ë®µëŞœë¸åÎÛmœÑ­=Óİ=Óİ=åş_ë®ùéî·åş_ÙÍ´ï~ùëmİîøïŞôë½İ½Óİ=Óİ=ïn¹ïùïnÛNöë}ÛÑ­=Óİ=íİÓİ=íİÓŞİÛN¹éÎ÷ë´í½Óİ=ï~ùëmİîøïŞôë´İİ´ëúï_ëŞ¸İ½Óİ=ëŞºÛM¼ï~ùën÷ë~öëŞ¶ë_ë®œë^»ÛİÓİ=ÓŞöë}´İİ´ï­øéÍöåş¹ï®¹éîøåş÷ï¶ï~·ïn½ën¹ÛÎºëÍœÛN÷ï¶ÙÍÓİ=Óİ=áŞ5çÎ_ãŞwçN_ç­øéÍöåş9ç®9áîxç}œÛNçáÍ½İ½Óİ=ëœï~¹Ñ­=Óİ=ïn·ÛMİÛNúßœßn_ëúëï_ïï~ùën÷ë~öëŞ¶ë¼ë®¼ÙÍ´ï~ùëm½İ½Óİ=ëŞºÛM¼ïn·ÛMµİİ´ßM½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ç~ùën÷ÛN¹ï®¹éîøåşøïŞôë´İİôïÍ¹ïÍ´ë®µëŞœë¸åÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN÷ï¶ÙİŞïıïN¹ÛİÛÑ­=Óİ=ïn¹ïùïnÛNöë}ÛÑ­=ÓŞİÑ­=íİÓŞöëøïöéí´ïn·İ½íİÑ®÷ïµï½ë}´ëŞéÎ½éî¹ÛN½éîøÛNï~åş½ï~ôåşôïnŸë~¹ï~÷åş¹ï®¹éîøåş÷ï¶ï~·ïn½ïNøëŞŸéí¼ï~øïnùë~øÛNúßœßn_ë®¼ÛMšë®¼ÙÍÓŞ÷ïöï·ï´ï­øéÍöåş¹ï®¹éîøåş÷ï¶ï~·ïn½ïNøëŞŸéí´Ù®÷ï¶ÙÍ´ënŸéşœÛN÷ï¶ï~·ïn½ën¹åşºéÎµë½½Ñ®ÛÑ­=ëŞï´ïn·ÛMİÛMôÙÍ´ëúï_éŞµï~›åş½éî¸ëüÛMİÛMôİ½ÓŞùß}öÛN¹ï®øåşë^÷é½´İİ´ï~ùëmİîøïŞôëÛÑ­=ï÷ßm´ëúï_ëŞ¸ÛMİÛMôİ½Ñ­=ëŞºÛM¼ëúï_éŞµï~›ÛMİİİ´ãŞwçN_ãzãç_ç~yãnwåşã^wá¾_áîáî9Ûİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ç~ùën÷ÛN¹ï®¹éîøåşøïŞôë´ëŞ÷ÛNéşëİßNüÛüåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´ëúï_éŞµï~›ÛİÛÑ­=ÓŞöëøïöéí´ßMÛÑ­=íİÑ­=ë®Ÿïm´ÛÎ¹ï®øåşë^÷é¾_ëŞë¹ïÍ´İİ´ãŞwçN_ãzãç_áŞ5ç~åş=áî8ã|åşwç5çwåşáşxãŞ:çİÛÑ­=ÓŞ¹ï®øåşë^÷é¾_ëŞë¹ïÍ´İÍİÛN=ç~tåş9ç®9áîxåşã^wá¾_ãŞã9çÎ_ç~ã®_çtã5ç9åşã^áşwã7İ½Óİ=ëúï_éŞµï~›åş½éî¸ëüÙ½›Ûİ´í½Óİ=ëŞºÛM¼ëúï_éŞµï~›ÛMºÛM¼ß]ÜİÎ¹ï®øåşë^÷é¾_ëŞë¹ïÍ½Ûİ´í½Óİ=ÓŞ¹ï®øåş½ë´İİ´éŞ÷éŞ_ëŞ÷ïN_ëúï_éŞµï~›åşøéş_ëŞ÷ïN_ëúëï¼ëúï_éŞµï~›åş½éî¸ëüÛİÛÑ­=Óİ=ïn·ÛMİÛNï~åş½ï~ôåş÷ï¶ï~·ïn½ën¹åş¹ï®¹éîøåşë^÷é½¼ë®¼ÙÍ´ï~ùëmœÑ­=Óİ=ÓŞ¹ï®øåşë^÷é¾_ëŞë¹ïÍœÛN¹ï®øåş½ëœÛN÷ï¶ï~·ïn½ën¹åşºéÎµë½½İ½Óİ=ÓŞ½ë­´ÛÎöë}´Û]İÛMôÛİ´í½Óİ=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ç~ùën÷ÛN¹ï®¹éîøÛN½éî¸ëüİ­¹ë´ë®µëŞœë¸åÎÛmœÑ­=Óİ=Óİ=åş_ë®ùéî·åş_ÙÍ´ëúï_éŞµï~›åş½éî¸ëüÛİÛÑ­=Óİ=ÓŞöëøïöéí´ïn·İ½Óİ=ÓŞİÑ­=ÓŞİÑ­=íİÓŞöëøïöéí´ïn·İ½íİÑ®½éîøÛNï~åş½ï~ôåş÷ï¶ï~·ïn½ën¹åş¹ï®¹éîøÛÎ÷ïöï·ï´ï­øéÍöåş÷ï¶ë¹ï­´Ù®÷ëœÛN÷ïöï·ï´ï­øéÍöåşºëÍ´Ù®ºëÍœÑ­=ï~øïnùë~øÛNúßœßn_ëúëï_ï~ùën÷ë~öëŞôï½éşÛMšï~ùëm½Ñ®ÛÑ­=ïn¹ïùïnÛNï~åş½ï~ôåşôïnŸë~¹ï~÷åş¹ï®¹éîøåş÷ï¶ï~·ïn½ïNøëŞŸéí¼ë®¼ÙÍ´ï~ùëmœÛNøïnùë½İ½íİÑ®½éîøÛNï~åş½ï~ôåşùéî÷ï¶ï~·ïn½ën¹åş¹ï®¹éîøÛÎ÷ïöï·ï´ï­øéÍöåş÷ï¶ë¹ï­´Ù®÷ëœÛN÷ïöï·ï´ï­øéÍöåşºëÍ´Ù®ºëÍœÑ­=ï~øïnùë~øÛNúßœßn_ëúëï_ï~ùën÷ë~öëŞôï½éşÛMšï~ùëm½Ñ®ÛÑ­=ïn¹ïùïnÛNï~åş½ï~ôåşôïnŸë~¹ï~÷åş¹ï®¹éîøåş÷ï¶ï~·ïn½ïNøëŞŸéí¼ë®¼ÙÍ´ï~ùëmœÛNºë^œï~¹ÛİÛÑ®İÑ­ï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåş÷ïµïnøåşºëøë~¼åş¹éî»ëŞë¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓŞúéş½ë´Ù®µïn»Ûİí½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë®¹ï·ëÎ_ëë¾_ï~øë^öï´Ù®ºë_ë~ºë½´İİ´ë^öë½ÛÑ­=ÙıšÑ­=ÛMšÛN:éşöÛNë®ºéÎ½éî¹ÛNzã®9ÙÍ´ãÎ5áÍ´ëüïN¹ë~øï}´ï~µéŞ¹ÛNºïnµéŞ¹ÛN½ëÓİ´Ù­´ë®Ÿïm´éşºë®œëŞë´éşùïôïøÛNûëÎ½ë~¼ÛN½ï´ïn¹ï^ùë÷ï¹ë´ëŞÛN¸éş_ïn¹ïNöéş·ë÷ï}Ñ­=ÛMšÙıÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]ÙîºïnµéŞ¹åş½ë´İİÓİ=ë®¹åş·ë®»ÙİŞë®öë^ë_ëŞ¸İ½ÓŞöëøïöéí´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî÷ïµïnøåşºëøë~¼åş¹éî»ÛÎúë®¹åş¸ëúÙÍÓİ=ÓŞµïn»ÛİÛÑ®İÑ­ï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåş÷ïµïnøåşºëøë~¼åş¹éî»ëŞë_éŞùéÎøëŞ_ïNµï~÷ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÑ­=ï®ŸëŞ¸ÛMšë^öë½½Ñ®ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşºëøë~¼åş¹éî»åşïœï½åşôë^÷ï~_ï~øë^öï´Ù®ºë_ë~ºë½´İİ´ë^öë½ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşµïÎ½åş÷ïöëµéİ´Ù®÷ïöëµéŞ_ëŞë®ŸÛMİÛNçáÍÛÑ­=ëŞï´ëİ´İİ´ßMœÛNöë}ÛÑ­=ï½éîøß}öåşøÛNûéŞ_ïn¹éÎŸë^¸åşë^÷é½´İİ´ßMÛÑ­=ëŞï´ï®ºë_ëŞ¸ïÍÛÑ­=ÙıšÑ­=ÛMšÛN:éşöÛNë®ºéÎ½éî¹ÛNzã®9ÙÍ´ãÎ5áÍ´ëüïN¹ë~øï}´ï~µéŞ¹ÛNºïnµéŞ¹ÛN½ëÓİ´Ù­´ë®Ÿïm´éşºë®œëŞë´éşùïôïøÛNûëÎ½ë~¼ÛN½ï´ïn¹ï^ùë÷ï¹ë´ëŞÛN¸éş_ïn¹ïNöéş·ë÷ï}Ñ­=ÛMšÙıÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]ÙîºïnµéŞ¹åş½ë´İİÓİ=ë®¹åş·ë®»ÙİŞë®öë^ë_ëŞ¸İ½ÓŞ½ë­´ÛÎºë_ë~ºë½İîŸë®ºéÎ½éî¹åşôë^÷ï}´İİİÛNã®:áÎ=áî9åşwã7áşã_çN5ç~wÛİ´í½Óİ=ï~øïn¹ë^åş½éîºéı´İİ´éŞ÷éŞ_ëŞ÷ïN_ë¾¹ï_ï~øïn¹ë^åş·éşéŞŸéî_ëµïµÛÎúë®¹åş¸ëúÙÍÓİ=ÓŞ<ã^ãã_çåş=ã|ÛÎºë_ë~ºë½İîŸïøïNùï_ï~øïn¹ë^åş½ë½ÛİÛÑ­=ÓŞ½ë­´ÛÎ÷ïöëµéŞ_ëŞë®ŸÛMİİİ´áîyáÎÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN9ïnöéşöÛN½éí´áşºë®œëŞë´ïNöéş·ë÷ï~\éí¶ÙÍ´åş_ë®ùéî·åş_ÛİÛÑ­=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=íİÓİ=ï®ºë_ëŞ¸ïÍ´İİ´éŞ÷éŞ_ëŞ÷ïN_ë¾¹ï_ï®ºë_ëŞ¸ïÎ_ë®Ÿïn_ï~øïn¹ë^ÛÎúë®¹åş¸ëúÙÍ´ï~øïn¹ë^åş½éîºéı½İ½Óİ=éŞ÷éŞ_ëŞ÷ïN_ïn¹ï~¹ï_ë®öë^ë¸ïnŸïM¼ï®ºë_ë¹ï­œÛN÷ïöëµéŞ_ëŞë®ŸÛİÛÑ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéÎŸë~›ÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ë~ºë¾_éşºë®œëŞë_ïN½éî»åşôéşë¾_ë^¸ëöë÷ï}¼ï®ºë_ë¹ï­œÛN÷ïöëµéŞ_ëŞë®ŸÙÍÓİ=ÓŞzã®9åştãŞã¾_ã®ã^;ÙÍ´ë®¹åş·ë®»ÙİŞéşùïôïøåş¶ïºåş½ëüÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞënùë®_éŞ»ïmİîœéş·é½½İ½Óİ=ëŞºÛM¼ïn·ÛMÜÛMôÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN:ëøë~¼ÛN¹éî»ëŞë´ë~ŸéîºëŞ»ÛNºë^½éÎ¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÛİÛÑ­=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=íİÓİ=ë®Ÿïm´ÛÎ½ÛMİÛMôİ½´ëİ´İÍ´ï~øïn¹ë^åş½éîºéıİîïåşôéÎµéî¹ï}ÛÛN½Ù½›Ûİ´í½Óİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷ÙîµïÎ½åşŸïN÷Ùî¹éîµënœë_ï¾ÛÍÓİ=Óİ=ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ëœÑ­=Óİ=ÓŞ÷ïöëµéŞ_ëŞë®ŸÙİŞï¾å¾úë®¹åş½ëüåŞ[ëŞ]ÙÍ´ß]½İ½Óİ=ÓŞûéŞ_ïn¹éÎŸë^¸åşë^÷é½´íÍİÛM¼ß]´İÍÜÛN÷ïöëµéŞ_ëŞë®ŸÙİŞï¾å¾úë®¹åş½ëüåŞ[ëŞ]ÛİÛÑ­=ÓŞİÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ïn¹ë¾_ïôëµï¹ÛÎúë®¹åş¸ëúÙÍÓİ=ÓŞzã®9åşwçn7åşã^|ÛİÛÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷ÙîµïÎ½åşŸïN÷Ùîöëœéşµë_ï¾ÛÎúë®¹åş¸ëúÙÍÓİ=ÓŞúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹ÙÍ´ï¾åşöëœéşµë_éŞµï~›ÛİÛÑ­=íİÓŞöëøïöéí´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî÷ïµïnøåşºëøë~¼åş¹éî»åşïœï½åşôë^÷ï}¼Ñ­=Óİ=ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåşºëøë~¼åş¹éî»ëŞë_ëŸéî¹åşéşøëŞºïİ¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë®¹ï·ëÎ_ëë¾½éî¹åş½éîºéı´Ù®ºëøë~¼åş¹éî»ëŞë_ëŞë®ŸÛİí½ÓŞ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ëúëï_ëµïµÛNºë_ïn¸åş¸éşë_ëúëïÛÑ­ÓŞëï~¹ï¼Û®ºë_ïn¸åş¸éşë_ëúëïœÛMôÙÍ´ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ëúëï_ëµïµÛİ½İ½ÓŞºë_ïn¸åş¸éşë_ëúëïë®öë^ë_ëŞ¸ÛMİÑ­=ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]ÙîºïnµéŞ¹åş½ëÛÑ­=ë®¹åşöë_ëŸéî¹åş¹ï®¹éîøÙîùÙîºëøë~¼åş¸éşëï~¹ï~÷ëŞŸéî_ëŞ¸ÛMİÑ­=ÓŞºëøë~¼åş¹éî»ëŞë_ëŞë®ŸÙİŞï~¹ï~÷ëŞŸéî_ëŞ¸İ½ÓŞºë_ïn¸åş¸éşë_ëúëïïë®¹ï·ëÎ_ëŸéî¹Ùî÷ïöëµéŞ_ëŞ¸ÛMİÛNºëøë~¼åş¹éî»ëŞë_ëŞë®ŸÙİŞï~øïn¹ë^åş½ëÛÑ­=ë®¹åşöë_ëŸéî¹åş¹ï®¹éîøÙîùÙîºëøë~¼åş¸éşëëÎµéî¸éÎ¹ÛMİÛNºëøë~¼åş¹éî»ëŞë_ëŞë®ŸÙİŞënùë®õåş¼ë^ëœëÛÑ­=ë®¹åşöë_ëŸéî¹åş¹ï®¹éîøÙîùÙîºëøë~¼åş¸éşëënùë®_ëŞ¸ïÍ´İİ´ë®¹ï·ëÎ_ëë¾½éî¹åş½éîºéıİî¶ïºåş½ëüİ½ÓŞºë_ïn¸åş¸éşë_ëúëïïë®¹ï·ëÎ_ëŸéî¹Ùîºë´İİ´ë®¹ï·ëÎ_ëë¾½éî¹åş½éîºéıİîºëÛÑ­=ë®¹åşöë_ëŸéî¹åş¹ï®¹éîøÙîùÙîºëøë~¼åş¸éşëéşºë®œëŞë_éŞŸë¹ÛMİÑ­=ÓŞºëøë~¼åş¹éî»ëŞë_ëŞë®ŸÙİŞéşºë®œëŞë_éŞŸë¹İ½Ñ­=ãŞwçN_ã6ã½¼Ûm¹ï}Úç®:ã¹ë´ãŞwçN_ãzãç_ã®9åşvã5ã_ãáî9ÛN¶ïºåş½ëüÛM¹ë\éí¶ÙÍÓİ=åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­İîôë¹ï­İî½ëœÛNºëøë~¼åş¹éî»ëŞë_ëŞë®ŸÙİŞënùë®_ëŞ¸ïÍ½İ½ÓŞºëøë~¼åş¹éî»ëŞë_ëŞë®ŸÙİŞëŞ÷åş¶ï÷ïİ´İİ´ßMÛÑ­=éŞ÷éŞ_ëŞ÷ïN_ï~¹éî¸åş¹ï®¹éîøÛÎúë®¹åş¸ëúÙÍ´ãŞwçN_ãzãç_ã®9åşvã5ã_ãáî9ÙÍ´Û®ºë_ïn¸åş¸éşë_ëúëï½İ½íİÑ®÷ïµï½ë}´ëŞï´éŞ÷éŞ_ëŞ÷ïN_ë~ºë¾_ïN½ïÍ¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ëŞïNùï_ë~ºë½´Ù®½éîôïøåş·ë®»Ûİí½ÓŞ½éîøÛNöë}´İİ´ßMÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşôëŞüåş·ë®»ÛMšïN½ïÎ_ë~ºë½´İİ´áîyáÎİ½Ñ­=ëŞºÛM¼ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİë^·ï½ï®¹Ûİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ï~öë}´Û¸ÛNôë^øëÍ´ëŞ÷ÛNµë~øëŞúë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´ç®:ã_çN=çÎ_ßM½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­ÓŞôëŞüåş·ë®»ÛMİÛMºëŞïNùï_ë~ºë½İî¸ÙîôëŞüåş·ë®»İ½ÓŞúë®¹åş¸ëúÙİŞëÎúïÎ_ë~ë´İİ´ïN½ïÎ_ë~ºë½İî¼ï®üåş·éŞ¸İ½ÓŞúë®¹åş¸ëúÙİŞëŞ÷åş÷ïNœëŞøÛMİÛN½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ëŞ÷åş÷ïNœëŞøİ½Ñ­=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİïN½ïÎ¹éÎ_ë~œéş·é½´İİÓİ=ëŞïNùï_ë~ºë½İî½éîôïøåşôëŞüåş·éÎ›İ½ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]Ùî½éîôïøåşïüÛMİÑ­=ÓŞ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ëŞïNùï_éŞùïÍÛÑ­=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİëŞïNùï_ë®Ÿïnë^øÛMİÑ­=ÓŞ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ëŞïNùï_ë®Ÿïnë^øİ½ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]Ùî÷éşºåş·éşùéîøëöåş÷ï¹ïM´İİ´ß]ÛÑ­ÓİŸÙ­Óİ´Ù­´ã®½éÎœÛNôëŞüëœåş·éÎŸë~›ÛN½éîøéı´ëŞïNùï_ïN½ïÎ_ë~œé½´ï~ŸÛNøëÎµï´ï÷ëöÛN÷ïNµë~¹Ñ­=ÛMšÛN·ë^ÛNùï~¹ÛNöéşùéî¸ë¸ÛN·éÎ›ÛNöë^øëÓİ´Ù­ŸÑ­=ëŞïNùï_ë~ºë½İî½éîôïøåşôëŞüåş·éÎ›ÛMİÑ­=ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]ÙîôëŞüëœåş·éÎŸë~›İ½Ñ­=ãŞwçN_ã6ã½¼Ûm¹ï}ÚÛN½éîôïøÛNïüÛN½ï}´Û¸ÛN7ã^ãŞ:ÛM¹ë´ëŞŸåşºéşöéŞµï´ßNüÛüåÎÛmœÛN_åşºïë~_åıœÑ­=ÓŞ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ëŞïNùï_éŞùïÍœÛN7ã^ãŞ:ÙÍÓİ=ëŞïNùï_ë~ºë½İî¸ÙîôëŞüåş·ë®»Ùî½éîôïøåşºéşöéŞµï½İ½Ñ­=ëŞºÛM¼ëŞïNùï_ë~ºë½İî¸ÙîôëŞüåş·ë®»Ùî½éîôïøåşïüÛMİİİ´ã~5áŞ=ã­´íÎÜÑ­=ÓŞ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ëŞïNùï_éŞùïÍ´İİİÛNxãwç;ãÛİ´í½Óİ=ëŞºÛM¼ëŞïNùï_ë~ºë½İî¸ÙîôëŞüåş·ë®»Ùî½éîôïøåşïüÛMİİİ´ã~5áŞ=ã­½Ñ­=Óİ=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİï¾½ëøëÍ´İİÓİ=Óİ=ëŞïNùï_ë~ºë½İî¸ÙîôëŞüåş·ë®»Ùî·ë^ëŞºåş·ë®»ÙîôëŞüëœï~_ïN¹ïn_éÎ½éî¹İ½Óİ=ëŞºÛM¼ëŞïNùï_ë~ºë½İî¸ÙîôëŞüåş·ë®»Ùî½éîôïøåşïüÛMİİİ´ç9ç~xã¾9áí½Ñ­=Óİ=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİï¾½ëøëÍ´İİÓİ=ÓŞ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ï¹ï~øë¾¹éî_ë~ºë½ïN½ïÎ¹éÎ÷åşôëöåşœëŞëÛÑ­=ÓŞ½ë­´ÛÎ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ë~µéŞ½ë®_ë~ºë½ï~ùën÷ë^ïNœë_ë~ºë½Óİ=Óİï~Ÿë®_ë~Ÿïï¹ïn_ï~øëôÛMŞÛMôÛİ´í½Óİ=ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[Ñ­=Óİ=ç®:ã_çN=çÎ_ßN]Ùî÷éşºåş·éşùéîøëöåş÷ï¹ïM´İİÓİ=ÓŞ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ë~µéŞ½ë®_ë~ºë½ï~ùën÷ë^ïNœë_ë~ºë½Óİ=Óİ=Ùî÷éşºåş·éşùéîøëöåş÷ï¹ïMÛÑ­=ÓŞİÑ­=íİ´ëœï~¹ÛN½ë­´ÛÎ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ëŞïNùï_éŞùïÍ´İİİÛN9çÎxãváî5áÎ_çn9ã^8Ûİ´í½Óİ=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİï¾½ëøëÍ´İİÓİ=ÓŞ½éîôïøåş·ë®»ÙİŞëïN½ïÎ_ë~ºë½ë®¹ï·ëÎ_ëë¾½éî¹åş·ë®»Ùî¶ïºåş÷ïöëŞ¸ëÛÑ­=íİÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ë~ºë¾_ëŞïNùï_éŞùïÍ¼Ñ­=Óİ=ï®ºë_ë¹ï­œÛMºëŞïNùï_ë~ºë½İî¸ÙîôëŞüåş·ë®»ÛİÛÑ­=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùîöë»åşùïN¸ë^øë¼ï®ºë_ë¹ï­œÛNzã®9åştãŞ|åıôÛİÛÑ­=ïn¹ïùïnÛNöë}ÛÑ®İÑ­ï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåş·ë®»åşöë½ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÑ­=ï~øïnùë~øÛNï~åşúë®¹åş½éîôïøåş·ë®»ÛMšëŞïNùï_ë~ºë½½Ñ®ÛÑ­=ëŞï´ïn·ÛMİÛMôİ½Ñ­=ëŞºÛM¼ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾½éîôïøåş·ë®»ÙİŞëŞïNùï_ï~öë~]Ùîµë~øëŞúë½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛNvã^{Û¸ÛNôë^øëÍ´ëŞ÷ÛNµë~øëŞúë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍÓİ=Óİ´ÛM´ëŞïNùï_ë~ºë½İî½éîôïøåş÷ïn·ÛMÛNzã®9åşvã^{åıôÛİÛÑ­=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=íİÑ­=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾½éîôïøåş·ë®»ÙİŞëŞïNùï_ï~öë~]Ùî÷éşºåş·éşùéîøëöåş÷ï¹ïM´İİ´ß]ÛÑ­ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ëŞïNùï_ë~ºë½İî½éîôïøåş÷ïn·åİïN½ïÎ¹éÎ_ë~œéş·é½´İİÓİ=ëŞïNùï_ë~ºë½İî½éîôïøåşôëŞüåş·éÎ›İ½ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ë~ºë¾_ïn¸ëŞ_ïn¹ë½¼Ñ­=ÓŞúë®¹åş¸ëúÙÍ´Û®½éîôïøåş·ë®»ÙİŞëïn¸ëŞ_ë~ºë½œÛN½éîôïøåş·ë®»ÙİŞëŞïNùï_ï~öë}½İ½ÓŞöëøïöéí´ïn·İ½íİï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåş÷ëøåş¸ïµéÎ_ï®ºë_ï~ıéî·åşéş¸ë¼Ñ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍ´ï®ŸëŞ¸ÛMšë^öë½½Ñ®ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş¸ïµéÎ_ï®ºë_ï~ıéî·åşéş¸ë´Ù®éş¸ë´İİ´ë^öë½ÛÑ­ÓŞúë®¹åş¸ëúÙİŞëùë^œåşúë®¹åş÷ïŞë~_ëë^¶éÎ¹ÛMİÛNéş¸ëİî¹éîµënœëÛÑ­=ïn¹ïùïnÛMôİ½íİï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåşë^éş_ï~¹ë~_ï½éŞ¹ï~øë^ïM¼Ñ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍ´ï®ŸëŞ¸ÛMšë^öë½½Ñ®ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşë^éş_ï~¹ë~_ï½éŞ¹ï~øë^ïM´Ù®éş¸ë´İİ´ë^öë½ÛÑ­ÓŞúë®¹åş¸ëúÙİŞéîµéîŸï~¹ë~_ï÷åş¹éîµënœë´İİ´éŞŸë¹ÙİŞëë^¶éÎ¹İ½ÓŞöëøïöéí´ßMÛÑ®İÑ®½éîøÛNï~åş½ï~ôåş·ë®»åş½éîôïøÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÛNúéş½ë´Ù®µïn»Ûİí½ÓŞ½éîøÛNöë}´İİ´ßMÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş½éîôïøåş·ë®»ÛMšëŞïNùï_ë~ºë½´İİ´ë^öë½ÛÑ­=éÎŸéî»ÛNôëŞüëœåş·éÎŸë~›ÛMİÛMôİ½Ñ­=ï~ûëŞøë~¼ÛM¼ëŞïNùï_ë~ºë½İî½éîôïøåş÷ïn·Ûİ´í½ÓŞ·ë^÷ë´ç®:ã_çN=çÎ_ßMÚÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ë~ºë¾_ïN½ïÍ¼ï®ºë_ë¹ï­œÛN½éîôïøåş·ë®»ÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®:ã_çn5ç¾_ßMÚÑ­=ë~µï~¹ÛNzã®9åşvã^{åıõİ­ÓŞ·ë^÷ë´ç®:ã_çn5ç¾_ßmÚÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ë~ºë¾_ïn¸ëİ¼ï®ºë_ë¹ï­œÛN½éîôïøåş·ë®»ÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ¸ëºë^ùéÎøİ­Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ãŞï®µéÎ½ë´ëŞïNùï´ï~Ÿïöë~¹åÎÛmœÛN_åşºïë~_åı½İ½Óİ=ïn·ÛMİÛMã=áîzã^İ½ÓŞİÑ­ÓŞôëŞüëœåş·éÎŸë~›ÛMİÛN½éîôïøåş·ë®»ÙİŞëŞïNùï_ïN½ïÎ_ë~œé½ÛÑ­=ÙıšÑ­=ÛMšÛNéîœïİ´ï~¹ï´ïnµï¹ÛNøéı´ëÎ½ë¾¼ëöÙÍ´ëŸÛNéşøÛNœéşûëöÛN¼ëŞ»ëÎ¹ïmÓİ´Ù­´ïnµï¹ÛNë¹ë¹ë´ënıÛNµéîŸï¼ëöÛN½éîôïøÑ­=ÛMšÙıÓŞ½ë­´ÛÎôëŞüëœåş·éÎŸë~›ÛMŞÛNúë®¹åş¸ëúÙİŞï®ºë_ë~œé¾_ëŞë®Ÿå½Óİ=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_ë~œé¾_ëŞ¸ïÎ]Ùî·éÎ›åşöë^øë½ÛNÛÑ­=ÓŞöë}´İİ´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ïNœë^øë®ŸïnåşŸïN÷Ùî÷ëøåş·éÎ›åşöë^øë¼Ñ­=Óİ=ï®ºë_ë¹ï­œÑ­=Óİ=Û®ôëŞüëœåş·éÎŸë~›ÛİÛÑ­=ÓŞ½ë­´ÛÎöë}´İÍ´ßM½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ë~œéş·é½´ï~¹ï´ïnµï¹ÛNºë^½éÎ¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÛİÛÑ­=Óİ=ïn¹ïùïnÛNöë}ÛÑ­=ÓŞİÑ­=íİÓŞöëøïöéí´ïn·İ½íİÑ®÷ïµï½ë}´ëŞï´éŞ÷éŞ_ëŞ÷ïN_ëùë^œåş¼ï¾_éŞµï~øëöåş÷éÎµï®¹åş÷ïŞë}¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓİ=Óİ=Óİ=ï®ŸëŞ¸ÛMšë^öë½½Ñ®ÛÑ­=ëŞï´ïn·ÛMİÛMôİ½Ñ­=ï~øïnùë~øÛNï~åş½ï~ôåş¸ïµéÎ_ëÎûåşë^÷ï¹ïn_ï~œë^úë_ï~ıéî·ÛMšéÎ½éî›ÛMİÛNµïn»İ½ÓŞùéî÷ëŞ»éî¹ë´éÎŸéî»ÛNºéÎµë¾÷İ½ÓŞ÷ïöï·ï´éŞµï~øëöåş÷éÎµï®¹åşöë÷éşùïn·ë_ëŞë®ŸÛMšéŞ÷åşöë÷ÛMİÑ­=Óİ=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîï~_ïn¹ï~Ÿïöë~¹İ½ÓŞ½éîøÛN½İ½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ï~öë~_ëŞë®ŸÛMšï~öë~_ëŞë®ŸÛMİÛNçáÍÛÑ­ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍÓİ=Óİºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞë~ŸéŞéşåş¸ëúåş¸ë^øë^_éÎŸë~›ÙÍÓİ=ÓŞºéÎµë¾÷ÛİÛÑ­=éŞ÷åşöë÷ÙİŞëùë^œåş÷ïŞë~_éŞŸë¹ÛMİÛNœëŞé½İî÷ïŞë~_éŞŸë¹İ½ÓŞ½ë­´ÛÎï~_ïn¹ï}İî¸ïµéÎ_ï~ıéî·åşéş¸ë´İİİÛNç~åş=ç~tåş8ç5áÎ_ã~5áŞ_ã^wçŞã}½ÛNÛÑ­=ÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛNã^|åşzã®9ÛMšÛNzã®9åşwçn7åşã^|İ½´ëİ›Ù½½ÛNÛÑ­=Óİ=ëŞºÛM¼éŞ÷åşöë÷ÙİŞï~öë~_ëŞë®Ÿå¾½åİ´İİİÛNçáÍ½Ñ­=Óİ=ÓŞ·éşï½éîùëÛÑ­=Óİ=ï~öë~_ëŞë®ŸÛMİÛNï~_ïn¹ï}İî÷ïn·åş½éîºéş[ëŞ]İ½Óİ=ÓŞ½ë­´ÛÎ÷ïn·åş½éîºéıİî¸ïµéÎ_ëÎûåşï~_ëŞë®ŸÙî÷ïŞë~_ï~øë^øë´İİİÑ­=Óİ=ÓŞç~åş=ç~tåş8ç5áÎ_ã~5áŞ_ã^wçŞã}½Ñ­=Óİ=ÓŞ·éşï½éîùëÛÑ­=Óİ=éŞ÷åşöë÷ÙİŞë^·ï½ï®¹åş÷ïn·åşë^÷é½´Û­İÛNŞÛÍõÛMÜİÍÓİ=Óİ=ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_éŞ÷åş½éîºéıëŞë¹ïÍ½İ½Óİ=ÓŞï~_ïn¹ï}İî÷ïn·åş÷éşºåşë^÷é½´Û­İÛNŞÛÍõÛMÜİÍÓİ=Óİ=ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_éŞ÷åş½éîºéıëŞë¹ïÍ½İ½Óİ=ÓŞ÷ïn·åş½éîºéıİî¸ïµéÎ_ëÎûåşï~_ëŞë®ŸÙî÷ïŞë~_ï~øë^øë´İİÓİ=Óİ=áŞwáŞ_ãŞwçN_ãyã^åş7ã^åş5ç~}áî7İ½Óİ=íİÓŞİÑ­=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍÓİ=Óİºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞë~ŸéŞéşåş¸ëúåş¸ë^øë^_éÎŸë~›ÙÍÓİ=ÓŞºéÎµë¾÷ÛİÛÑ­=ïn¹ïùïnÛNöë}ÛÑ®İÑ­ï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåş÷ëøåş¸ïµéÎ_ãÎ{åşë^÷ï¹ïn_ï~œë^úë_éŞŸë¹ÛÍÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÛNúéş½ë´Ù®µïn»Ûİí½ÓŞ½éîøÛNöë}´İİ´ßMœÛN½İ½ÓŞ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ï~¹ï_ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÛMšëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÛMİÛNçáÍÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş÷ïn·åş½éîºéı´Ù®÷ïn·åş½éîºéı´İİ´áîyáÎİ½ÓŞùéî÷ëŞ»éî¹ë´éÎŸéî»ÛNºéÎµë¾÷İ½ÓŞ÷ïöï·ï´éŞµï~øëöåş÷éÎµï®¹åşöë÷éşùïn·ë_ëŞë®ŸÛMšéŞ÷åşöë÷ÛMİÑ­=Óİ=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîï~_ïn¹ï~Ÿïöë~¹İ½Ñ­=ëŞºÛM¼Û^úë®¹åş¸ëúÛNÜíÍ´Û^µïn»Ûİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ãöïnŸïmµÛN=éîúë^œëŞ¸ÛN½éîôïøÛNúë®¹åş¸ëúÛM¹ïNÛNµïn»ÛM¹ïNåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=íİÑ­=ï~ôëŞåşœéş·é¾_ëŞöï^÷ë^úë¼Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî·éşéŞŸéî_ë¹ï®_ëµïµåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÛMİÛM¼ï~øïnùë~øÛNï~åş½ï~ôåş÷ëøåş¸ïµéÎ_ëÎûåşï~_ë~ë´Ù­½ë^öë½ÛÑ­=ï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞéŞ÷åşöë÷éşùïn·ëëùë^œåş¼ï¾_ïıïN¹ÛMİÛN8ç5áÎ_ãÎ{åşã^wç9çn_ç~ã^zãÛÑ­=ï®ºë_ë¹ï­İîúë®¹åşùën_ïNŸéÎ½ë~ıÛMİÛNç~åş{áŞ_ç6åş9ç^yã^åşwáÎ=ã~=áî;İ½ÓŞ½ë­´ÛÎ¸ïµéÎ_ëÎûåşï~_ë~ëİîôïn½éŞµïnıåş½éîøë­´İÍ´ç®:ã_ç~vã~_áŞ5çÍ½ÛNÛÑ­=ÓŞ=ç~tåş8ãn;ÛÍ¶Û÷İ­´ï®ºë´Û¸ÛNôïn½éŞµïnıåş½éîøë­´Û¸åÎÛmœÛN_åşºïë~_åıœÑ­=Óİ=ï®ºë_ë¹ï­İîôë¹ï­İî½ëœÛN¸ïµéÎ_ëÎûåşï~_ë~ëİîôïn½éŞµïnıåş½éîøë­½İ½Óİ=ï~öë~_ëŞë®ŸÛMİÛMºï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå½Óİ=Óİ=ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÙİŞïNöëŞë^öïŞ_ëŞïºåİÛÑ­=ÓŞ÷ïn·åş½éîºéıİî¸ïµéÎ_ëÎûåşøïŞôë´İİ´ãyã^åş<ç¾_áŞ5ç~xãvåşwáÎ5ç®9İ½Óİ=ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_éŞ÷åş½éîºéıëùë^œåş¼ï¾_éŞ÷åşøïŞôë´İİÓİ=ÓŞ¸ïµéÎ_ëÎûåşï~_ë~ëİî¸ïµéÎ_ëÎûåşï~_ïıïN¹İ½Óİ=ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_éŞ÷åş½éîºéıëŞë¹ïÍ´İİ´ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÙİŞïNöëŞë^öïŞ_ëŞïºÑ­=Óİ=Ù½´ç®:ã_ç~vã~_áŞ5çÍ´Ù­´ï®ºë_ë¹ï­İîôë¹ï­İî½ëÛÑ­=ÓŞï~_ïn¹ï}İî÷ïn·åş½éîºéş[ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_éŞ÷åş½éîºéıëŞë¹ïÎ]ÛMİÛN÷ïn·åş½éîºéıÛÑ­=ÓŞï~_ïn¹ï}İîïåş÷ïn·Ù½›İ½Óİ=ëŞºÛM¼ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÙİŞëùë^œåş¼ï¾_éŞ÷åşøïŞôë´İİİÛNç~_ç}çN9åşã^wç9çm½ÛNÛÑ­=Óİ=éŞ÷åşöë÷ÙİŞéŞµï~øëöåş½éî¸ëüÛMİÛN÷ïn·åş½éîºéıİî¸ïµéÎ_ëÎûåşï~_ëŞë®ŸÙî½éî¸ëüİ½Óİ=ÓŞï~_ïn¹ï}İî÷éşºåş¸ëœïµåşøëÎöë÷ëÎŸéÎ¸ÛMİÑ­=Óİ=ÓŞ¸ïµéÎ_ëÎûåşï~_ë~ëİî÷éşºåş¸ëœïµåşøëÎöë÷ëÎŸéÎ¸İ½Óİ=íİ´ëœï~¹ÛNÛÑ­=Óİ=éŞ÷åşöë÷ÙİŞïNöëŞë^öïŞ_ï~œï®_ëŞ¸ïÍ´İİÓİ=Óİ=ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_éŞ÷åş½éîºéıëŞë¹ïÍÛÑ­=ÓŞİÑ­=íİÓŞ=ç~tåş8ãn;ÛÍ¶Û÷İ­´ï®ºë´Û¸ÛNïåş÷ïn·ÛM¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­İîôë¹ï­İî½ëœÑ­=ÓŞ¸ïµéÎ_ëÎûåşï~_ë~ëİîïåş÷ïn·ÛİÛÑ­=ëŞºÛM¼ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÙİŞéîùéŞ_ï~öë}´İí´ç®:ã_ç~vã~_áŞ5çÍ½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN9ïnöéşöÛ]´ãŞï®µéÎ½ë´éîùéŞ_ï~öë}´Û¸åÎÛmœÛN_åşºïë~_åıœÑ­=Óİ=ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÙİŞéîùéŞ_ï~öë}½İ½Óİ=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍÓİ=Óİºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞë~ŸéŞéşåş¸ëúåş¸ë^øë^_éÎŸë~›ÙÍ´ë®œë^»ï}½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­=ÙıšÛNxëÎ½ï}´ë®Ÿïm´éÎŸéşôÛN½ï}´ë®Ÿïm´éîŸéíïNöëŞë^öïİ´ëŞïºÛNøéı´ën¹ÛNë^öé¾¹ë´ï¾½ï¼ÛNë^÷ï¹ïmŸç~œë^úëÓİ´Ù­´ëŞÛNŸïn¸ëöÛNºéşöÛNºïnµéŞ¹ÛN½ë´ï~ıéî·Ùí´ãnùï´ï¼ë½ïm´ï½éŞ¹ï~øë^ïM´ëŞ÷ÛNéşøÛN÷ë^úë¸ÙíÓİ´Ù­´ç~ŸÛNéı´ï~Ÿë®_ëŞë®ŸÛNöë÷éşùïn·ë´ëŞ÷ÛNµéÎœéş·ë^øë¸Ñ­=ÛMšÙıÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛN¸ïµéÎ_ëÎûåşï~_ë~ëİîïåş÷ïn·İ½´ëİ›Ù½½ÛNÛÑ­=ÓŞ½ë­´ÛÎ¸ïµéÎ_ëÎûåşï~_ë~ëİî½éîôïøåş÷ïn·å¾½åİ´İíİÛNzã®9åşwçn7åşã^|Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN9ïnöéşöÛ]´ãŞï®µéÎ½ë´ç~vã}´ïNµïnµéİ´Û¸åÎÛmœÛN_åşºïë~_åıœÑ­=Óİ=ÓŞ¸ïµéÎ_ëÎûåşï~_ë~ëİî½éîôïøåş÷ïn·å¾½åİ½İ½Óİ=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Ñ­=Óİ=Óİºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞë~ŸéŞéşåş¸ëúåş¸ë^øë^_éÎŸë~›ÙÍÓİ=Óİ=ë®œë^»ï}½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­=ÓŞ=ç~tåş8ãn;ÛÍ¶Û÷İ­´ï®ºë´Û¸ÛN÷ïn·ÛM¹ë´ïıïN¹ÛM¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍÓİ=ÓŞúë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸ÙÍ´ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÙİŞëŞïNùï_ï~öë~[ëŞ]ÙÍÓİ=ÓŞ¸ïµéÎ_ëÎûåşï~_ë~ëİî¸ïµéÎ_ëÎûåşï~_ïıïN¹ÛİÛÑ­=ÓŞ÷ïn·åş½éîºéı´İİ´Û®úë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[Ñ­=Óİ=ÓŞ¸ïµéÎ_ëÎûåşï~_ë~ëİî½éîôïøåş÷ïn·å¾½åŞ]İ½Óİ=ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_ïıïN¹ÛMİÛN8ç5áÎ_ãÎ{åşã^wç9çn_ç~ã^zãÛÑ­=ÓŞ÷ïn·åş½éîºéıİî¸ïµéÎ_ëÎûåşï~_ëŞë®ŸÙî¸ïµéÎ_ëÎûåşï~_ïıïN¹ÛMİÑ­=Óİ=ëùë^œåş¼ï¾_éŞ÷åş·éŞ¸ÙİŞëùë^œåş¼ï¾_éŞ÷åşøïŞôëÛÑ­=ÓŞ÷ïn·åş½éîºéıİî¸ïµéÎ_ëÎûåşï~_ëŞë®ŸÙî½éî¸ëüÛMİÛN¸ïµéÎ_ëÎûåşï~_ë~ëİî½éîôïøåş÷ïn·å¾½åİÓİ=Óİ=Ù½´ç®:ã_ç~vã~_áŞ5çÍ´Ù­´ï®ºë_ë¹ï­İîôë¹ï­İî½ëÛÑ­=ÓŞï~_ïn¹ï}İî÷ïn·åş½éîºéş[ï~öë~_ëŞë®ŸÙİŞëùë^œåş¼ï¾_éŞ÷åş½éîºéıëŞë¹ïÎ]ÛMİÛN÷ïn·åş½éîºéıÛÑ­=ÓŞï~_ïn¹ï}İîïåş÷ïn·Ù½›İ½ÓŞİÑ­=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞë~ŸéŞéşåş¸ëúåş¸ë^øë^_éÎŸë~›ÙÍÓİ=Óİ=ë®œë^»ï}½İ½ÓŞöëøïöéí´ïn·İ½íİÑ®÷ïµï½ë}´ëŞï´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸åşœëŞ÷ï_ïéÎŸë~›ë¸ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÛNúéş½ë´Ù®µïn»Ûİí½ÓŞ½éîøÛNöë}´İİ´ßMÛÑ­=ï½éîøß}öåşøÛN·éşùéîøÛMİÛMôİ½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ë_éÎ½ï~øÛMšïNöéş·åş·éŞ¸ÛMİÑ­=Óİ¼ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï´Ù­½ë^öë½ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï´ë~ëœÛN·éŞ¸åşëüïÛÑ­ÓŞ½ë­´ÛÍµï®ºë_ë¹ï­´íÎÜÛMµë^öë½½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛNúë®¹åş¸ëúÛM¹ïNÛNµïn»ÛM¹ïNåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=íİÑ­=ïn·ÛMİÛNï~åş½ï~ôåşôïnŸë~_ë~ë¼ï®ºë_ë¹ï­œÛMºïNöéş·åş·éŞ¸ÙİŞë~ºë¾_ë~ë½İ½ÓŞ½ë­´ÛÎöë}´İÍ´ßM½Ñ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛNöë}´Û¸åÎÛmœÛN_åşºïë~_åıœÛN_åşãŞã_åıœÛNöë}½İ½Ñ­=ë~ë´İİ´Ù®ôïnŸë~_ë~ëÛÑ­ÓŞûëÎ½éÎ¹ÛM¼ë~ëéî¹ïÎøÛİ´í½Óİ=ëŞºÛM¼ë~ëéî¹ïÎøåş÷ëŞÚë´Û]İÛN÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï½Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛNëüï´ï~½í®¹ÛM¹ï´Û]İÛN¹ïÎôë·ï¹ë´ÛÚï\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ë~ëéî¹ïÎøåş÷ëŞÚëœÑ­=Óİ=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï½ÛİÛÑ­=Óİ=ënöëµé½ÛÑ­=ÓŞİÑ­=ÓŞ½ë­´ÛÍ›Ù¾·éşùéîøÛMŞİİ´áŞ5çÎ_ãŞwçN_çn9ã¾_áÎ=ç~xÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛN9ïnöéşöÛN¹ïÎ·ë¹ë½éî»ÛNøëÎ¹ÛNë^üÛNöë»ëŞ÷ï¹ïm´ë~ŸïïÚÛùåÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÛN·éşùéîøÛİÛÑ­=Óİ=ïn·ÛMİÛMã=áîzã^İ½Óİ=ÓŞ¶ïn¹ë^›İ½Óİ=íİÓİ=ëŞºÛM¼ë~ŸïNıåşºïnŸéŞ_ï÷ëöÛÍºë~ë_éî¹ïÎøÙÍ´ÛÎúéş½ë´åş_ï÷ëöÛMšÛŞ·éŞ¸ÙîëüïœÑ­=Óİ=ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ë_éÎ½ï~øÛİ½Ûİ´í½Óİ=ÓŞöë}´İİ´ÙŞ9ã®5ççÛÑ­=Óİ=ë~ŸéîøëŞï¹İ½Óİ=íİÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸ÛÎúë®¹åş¸ëúÙÍ´Û®·éŞ¸åşëüïë~ºë¾_ë~ë½İ½Óİ=ëŞºÛM¼ïn·ÛMÜÛMôÛİÓİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛNöë}´Û¸åÎÛmœÛN_åşºïë~_åıœÛN_åşãŞã_åıœÛNöë}½İ½Ñ­=ÓŞ·éŞ¸ÛMİÛN·éŞ¸åşëüïÛÑ­=íİÓŞöëøïöéí´ïn·İ½íİÑ­·ëŞºë¹ë­´ã~áî:ãŞ;åş7áşçN5çï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸ßn_ß}öÛNÛÑ­=ï½éîøß]úåşøÛNïåş·ë®»İ½ÓŞùëŞïõß®_ï´ë~ë_éÎ¹éíÛÑ­=ë~ŸéŞôë^øåş·ë^¸ëöåşøÛN·ë®»åş¸ë^øë]ÛÑ­=ë~ŸéŞôë^øåş·ë^¸ëöåşøÛN·ë®»åş·éŞ¸İ½íİÛÑ­ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï_ß}öÛNÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸ßn_ß}öÛM´ÛN·ë®»åş·éŞ¸İ½ÓŞ·éşïNµï_ë~µë¸ïn_ï´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´éî¹ïÎøİ½ÓŞùëŞï÷ßn_ï´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´ÛM´éî¹ïÎøåş÷ëŞÚëÛÑ®İİ½Ñ­·ë¹ë®½éî¹ÛNzãŞ8ãŞã~_áŞwáŞ_ç®:ã_çn9ã¾_ã~:ã¾_ã~áŞtã^xÛN\Ñ­=åş=áş{çm¼Û¾zÛ½œÛN6ã^wã_ç®=ã=áş7åştçn=ç®5ç9ÙÍ´ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸ßn_ß}öÛİÛ~¸ëºëŞë´ç®=ã=áş7åşç~åşzã®9åşvã;åşãŞwç_ã~:ã¾_ã~áŞtã^xÛN\Ñ­=åş=áş{çm¼Û¾zÛ½œÛN6ã^wã_ç®=ã=áş7åştçn=ç®5ç9Ù½õßœÛN÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ë_éÎ½ï~øåı÷ßm½Ñ­ÙıšÑ­´Ù­´ßßİ´ã^6ãİ´éÎµïŞŸïøÛNŸë­´éŞ÷éŞ_ï®ºë_ë^üëŞ_ï~øïn¹ë^åş·ë®»åş·éŞ¸ÛM¼ßøÛN¶ïŞøë÷ÙÍ´éîŸÛNøïnµëŞœëŞë½ÛMšÛN¼ï¾_ï~øë^øë½Ùí´ÛM÷ßmën½ï´ï®¹éî¸éşöÛN<ã^ÛM¼éŞÙŞõë~µéŞ¹ïnµÙŞ¸ë^¹éŞŸéí½ÛN÷ëë÷Ñ­´Ù­´ç®=ã=áş7åşç~åş=ç~tåş7ã®;åşwçvã5áİ´ëë~Ÿë¹ë´ï¾½ï¼ÛNøëÎ½ï}´ßøÙŞ¶ïŞøë´ï~½í®¹İ½´ï¼ë´ßß]ıÑ­´Ù­´ë®Ÿïn›ÛNµë¸ë¸ÛN¹éîùéİ´éŞ÷éŞ_ï®ºë_ëÎûåş÷ïµï¹ÛNµï´ï¼ë´ïµëŞœÛNûëÎ½ë~¼ÛN·ëÎµéî»ë¸ÛNøëÎ¹ÛN½éş·ïœÑ­´Ù­´ëë~Ÿë½éî»ÙÍ´ï~ŸÛNöëë^ôÛN½ï´ëÎ¹ïn¹ÙíÛMšÙıï~øïnùë~øÛNï~åşúë®¹åşµïÎ½åş÷ïöëµéŞ_ë~ºë¾_ë~ë_ßøÛNÛÑ­=ï½éîøßÎ_ï´éîùéŞ_ï~øïn¹ë^ï}ÛÑ­=ï½éîøß}öåşøÛN÷ïöëµéŞ_ëÎµéî¸éÎ¹å¾zã®9åş5çÎ=åşwçn7åşã^|åİÛÑ­=ëïÛNï~åşúë®¹åşµïÎ½åş÷ïöëµéŞ_ë~ë´ë~ëÛÑ­=ï½éîøßÎ_ï´ï~ıéî·åşºïnµéŞ¹åş½ë_ï~öë}ÛÑ®İİ½Ñ­·ë¹ë®½éî¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ã~:ã¾_ç~xçn9ã^åşã;ã^7çİ´åÍÓŞ_ãŞç¾vÛÍ»ç­»ÙÍ´áŞwáŞ_ãŞwçN_ã~:ã¾_ç~xçn9ã^ÙÍ´ï~øïnùë~øÛNï~åşúë®¹åşµïÎ½åş÷ïöëµéŞ_ë~ºë¾_ë~ë_ßøÛİÑ®÷ïµï½ë}´ï®ŸëŞ¸ÛNï~åş½ï~ôåş·éşïNµï_ïŸåşôïnŸë~_ë~ë¼ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸ßm´Ù®ôïnŸë~_ë~ëœÑ­=ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸ßn_ß}öÛMšïNöéş·åş·éŞ¸åşôïöß}öÛİí½ÓŞôïnŸë~_ë~ëİîïåş·ë®»ÛMİÛNôïnŸë~_ë~ë_ïNøïm÷ßmİîïåş·ë®»İ½ÓŞôïnŸë~_ë~ëİî·éŞ¸åşœëÛMİÛNôïnŸë~_ë~ë_ïNøïm÷ßmİî·éŞ¸åşœëİ½ÓŞôïnŸë~_ë~ëİî·ë®»åş¸ë^øë]´İİ´ë~ŸéŞôë^øåşôïöÛÎôïnŸë~_ë~ë_ïNøïm÷ßmİî·ë®»åş¸ë^øë]½İ½ÓŞôïnŸë~_ë~ëİî·ë®»åş·éŞ¸ÛMİÛN·éşïNµï_ïNøïm¼ïNöéş·åş·éŞ¸åşôïöß}öÙİŞë~ºë¾_ë~ë½İ½íİÑ®÷ïµï½ë}´ëŞï´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸åşœëŞ÷ï_ë~ŸéŞôë^øÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÛNúéş½ë´Ù®µïn»Ûİí½ÓŞ½éîøÛNöë}´İİ´ßMÛÑ­=ï½éîøß}öåşøÛN·éşùéîøÛMİÛMôİ½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ë_éÎ½ï~øåı÷ßm´Ù®ôïnŸë~_ë~ë´İİÓİ=ÛÎ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ë_éÎ½ï~øåı÷ßm´Ù­½ë^öë½ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï_ß}öÛN·éŞ¸ÙÍ´ë~ë_éî¹ïÎøİ½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ëöÛN·ïöïn¹éîøåş·éŞ¸İ½Ñ­=ëŞºÛM¼Û^úë®¹åş¸ëúÛNÜíÍ´Û^µïn»Ûİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ë®µëŞœë¸İ­´ï®ºë_ë¹ï­´Ûôá½´ë^öë½´Ûôá¾\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÛNúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­=éŞ÷éŞ_ëŞ÷ïN_ë~ŸéŞôë^øåşøéş_ïNöéş·åş·éŞ¸ÛÍºë~ùïnöëï_ë~ëœÛMºïNöéş·åş·éŞ¸ÙİŞë~ºë¾_ë~ë½İ½ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸ÛÎúë®¹åş¸ëúÙÍ´Û®·ïöïn¹éîøåş·éŞ¸ÛİÛÑ­=ëŞºÛM¼ïn·ÛMÜÛMôÛİÓİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ë®µëŞœë¸İ­´ïn·ÛM¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ïn·ÛİÛÑ­ÓŞ·éŞ¸ÛMİÛMšïNöéş·åş·éŞ¸İ½Ñ­=ï¾¼ëŞœë´ÛÎ·éşïNµï_ïNøïm¼ë~ëéî¹ïÎøÛİ´Û]İÛNçáÍ½ÛNÛÑ­=ÓŞ½ë­´ÛÎ·éŞ¸Ùîëüï_ï~½í®¹ÛMµİİ´ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ë_éÎ½ï~øåı÷ßm½Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛNëüï´ï~½í®¹ÛM¹ï´Û]İÛN¹ïÎôë·ï¹ë´ÛÚï\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ë~ëéî¹ïÎøåş÷ëŞÚëœÑ­=Óİ=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï½ÛİÛÑ­=Óİ=ënöëµé½ÛÑ­=ÓŞİÑ­=ÓŞ½ë­´ÛÍ›Ù¾·éşùéîøÛMŞİİ´áŞ5çÎ_ãŞwçN_çn9ã¾_áÎ=ç~xÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛN9ïnöéşöÛN¹ïÎ·ë¹ë½éî»ÛNøëÎ¹ÛNë^üÛNöë»ëŞ÷ï¹ïm´ë~ŸïïÚÛùåÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÛN·éşùéîøÛİÛÑ­=Óİ=ïn·ÛMİÛMã=áîzã^İ½Óİ=ÓŞ¶ïn¹ë^›İ½Óİ=íİÓİ=ëŞºÛM¼ë~ŸïNıåşºïnŸéŞ_ï÷ëöÛÍºë~ë_éî¹ïÎøÙÍ´ë~ŸéŞôë^øåşôïöÛÎ·éŞ¸Ùîëüï½ÙÍÓİ=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸åşœëŞ÷ï_ß}öÛİ½Ûİ´í½Óİ=ÓŞöë}´İİ´ÙŞ9ã®5ççÛÑ­=Óİ=ë~ŸéîøëŞï¹İ½Óİ=íİÓİ=éŞ÷éŞ_ëŞ÷ïN_ë~ŸéŞôë^øåşøéş_ïNöéş·åş·éŞ¸ÛÍºë~ùïnöëï_ë~ëœÑ­=Óİ=Û®·éŞ¸åşëüïë~ºë¾_ë~ë½İ½Ñ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸ÛÎúë®¹åş¸ëúÙÍ´Û®·ïöïn¹éîøåş·éŞ¸ÛİÛÑ­=ÓŞ½ë­´ÛÎöë}´İÍ´ßM½Ñ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ë®µëŞœë¸İ­´ïn·ÛM¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ïn·ÛİÛÑ­Óİ=ë~ë´İİ´ë~ë_éî¹ïÎøİ½ÓŞİÑ­=ïn¹ïùïnÛNöë}ÛÑ®İÑ­ï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåşôïnŸë~_ë~ë_éÎ½ï~øÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÛNúéş½ë´Ù®µïn»Ûİí½ÓŞ½ë­´ÛÎ½ï~_ë~ŸéŞôë^øåşøë^÷é½¼Ûİ½Ñ­=ÓŞöëøïöéí´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸åşœëŞ÷ï_ë~ŸéŞôë^øÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½ÓŞ¹éÎ÷ëÓİ=ïn¹ïùïnÛNï~åş½ï~ôåşôïnŸë~_ë~ë_éÎ½ï~øåşùéîœéş·é¾¹ë¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ®İÑ­·ëœï~¹ÛMŸÙ­´ã~áî:ãŞ;åş7áşçN5ç´Ù­ŸÑ®÷ïµï½ë}´ëŞï´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸åşœëŞ÷ï¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍ´ï®ŸëŞ¸ÛMšë^öë½½Ñ®ÛÑ­=ïn¹ïùïnÛNï~åş½ï~ôåşôïnŸë~_ë~ë_éÎ½ï~øåşùéîœéş·é¾¹ë¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ®İÑ­·ëë½ë­´ÙıšÛN7áşã®=ã¾_ã~áŞtã^xÛMšÙıÑ®÷ïµï½ë}´éÎŸéî»ÛNï~åş½ï~ôåş½éş·ïœåşùéîœéş·é¾¹ë¼ï~øïnùë~øÛNúßœßn_ï~ùën¸ëúÛMšï~¸ÙÍÓŞùéî÷ëŞ»éî¹ë´ëŞï´ë~ëœÛNúéş½ë´Ù®µïn»Ûİí½ÓŞœéşë½´ïn·ÛMİÛMôİ½ÓŞœéşë½´ïn·ßm´İİ´ßMÛÑ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛMİÛNúßœßn_ë¾¹ï_ï~ùën¸ëúëµïµÛÎ÷ë½İ½Ñ­=ëŞºÛM¼Û^úë®¹åş¸ëúÛNÜíÍ´Û^úë®¹åş¸ëúÙİŞï®ºë_ënµï~¹Ûİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ë®µëŞœë¸İ­´ëŞï®µéÎ½ë´ïNµïnµéŞ÷ÛM¹ïNåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ï®ºë_ë¹ï­½İ½Óİ=ëŞºÛM¼ï®ºë_ë¹ï­½Ñ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ë®µëŞœë¸ÛM¹ïNåÎÛmœÛN_åşºïë~_åıœÑ­=Óİ=ÓŞ_åşãŞã_åıœÛNúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹ÛİÛÑ­=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=íİÑ­=ÙıšÛNùï~¹ÛNöëµéÍ´ï½éŞ¹ÛNïøëüÛNºéşöÛN¼ë^öë´ïn¹ë^œÙŞøëŞë´ëŞŸë~øéÎ÷ÛN÷ï·ëÍ´ë^÷Ñ­=ÛMšÛN¶ïºë®¹ïm´éşôëöë^øëŞŸéî÷ÛNµéî¸ÛNöë»ëŞ÷ï¹ïm´ïôëµï¹ï}Ñ­=ÛMšÛNyï~¹ÛN·éşöë´éŞùï¹ïÍ´ë®Ÿïm´éşøëÎ¹ïm´ëŞŸë~øéÎ÷ÛNøëÎµï´ë~Ÿïœë´ïµé¾¹Ñ­=ÛMšÛNœéşë¾¹ïm´ï½éŞ¹ÛNøéı´ë~ŸéŞôéÎ¹ï¹ÛN÷ï·ëÍ´ë^÷ÛN÷ïµïnøÙş÷ïŸïM´ãŞwçM´ï~øïn¹ë^ï}Óİ´Ù­´ï¾¼ëŞ·ëÍ´ënœéş·é¾÷ÛNùéîøëŞœÛNøëÎ¹ÛN¼ë^öëûë^öë´ï~øë^öïŸï~øéşôÛN÷ïöëµéŞ½éî»Ñ­=ÛMšÙıÓŞ=ç~tåş8ãn;ÛÍ¶Û÷İ­´ë~ëÚÛM¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´åş=áş7åşxçŞtã¼ë~ë½ÛİÛÑ­=ï~ûëŞøë~¼ÛM¼ë~ë½ÛNÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ç®:ã_çn9ã¾_ã~:ã½ÚÛNÛÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸ÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İîöëµéÎøëŞë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ç®=ã=áş7åşç~åşzã®9åşvã;åşãŞwç_ã~:ã½ÚÛNÛÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸åşœëŞ÷ï¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_çn9ç^yãwç_ãnyã­ÚÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_çn9ç^yãwç_ãnyã®_ç®9çmöİ­Óİ=ÙıšÛNºë^œéÎøëÎöéşùë¾¼ÛMšÙıÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş9áîuç9ç9åş6ç:İ­Óİ=ÙıšÛNºë^œéÎøëÎöéşùë¾¼ÛMšÙıÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş8ãuç9ç9åş6ç:İ­Óİ=ÙıšÛNºë^œéÎøëÎöéşùë¾¼ÛMšÙıÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåşyáîã^tåş6ç:İ­´í½Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéÎŸë~›ÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş¶ïºåş·éŞ¸ÛÎúë®¹åş¸ëúÙİŞënùë®_éŞ»ïmœÛN·éŞ¸ÙÍ´ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéÎŸë~›ÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_çn9áÎ9ã^wã_ãnyã­ÚÛNÛÑ­=ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞënùë®_éŞ»ïm´İİİÛNçáÍ½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ënùë­´éŞ»ïm´áîyáÎÛ]´ïn·ÛMİÛMß^\éí¶ÙÍ´åş_ë®ùéî·åş_ÛİÛÑ­=Óİ=ïn·ÛMİÛMã=áîzã^İ½Óİ=ÓŞöëøïöéí´ïn·İ½Óİ=íİÓİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéÎŸë~›ÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş¶ïºåş·éŞ¸ÛÎúë®¹åş¸ëúÙİŞënùë®_éŞ»ïmœÛN·éŞ¸ÙÍ´ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéÎŸë~›ÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_çn9ç^yãwç_ç~xçn9ã^İ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåşöëõï¹ï~øåşµïÎ½åş÷ïöëµéİ¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåşvãã5ç~9åşwçvã5áİÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïn¹éÎ¹ë^÷ë_ë^üëŞ_ï~øïn¹ë^ÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşyáîáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ã~:ã¾_ç~xçn9ã^İ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåş·ë®»åşµïÎ½åş÷ïöëµéİ¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş5çÎ=åş<ã^çÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ë^üëŞ_ëÎµéÎøÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşyáîáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ã^|ãŞ_çn9ç~9çÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞ½ë­´ÛÎµïŸéŞ½ë~_ïn¹ë^¸ÛÍºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıéşúëöë®œéşûåş÷ïµï¹ÛİÓİ=Óİµİİ´ãÎ5áÎxåş9áî:áşvã~9ã½ÛNÛÑ­=Óİ=ïn·ÛMİÛNï~åş½ï~ôåş÷ïµï÷åşöë÷ëøÛÎúë®¹åş¸ëúÛİÛÑ­=Óİ=ïn·ßm´İİ´éŞ÷éŞ_ëŞ÷ïN_ë^üëŞ_ïn¹ï~¹ï¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=Óİ=ëŞºÛM¼Û^öë}´Û­ºÛNöë}öÛİÓİ=Óİ=ïn·ÛMİÛNöë}öİ½Óİ=íİ´ëœï~¹ÛNÛÑ­=Óİ=ïNöåş¹ïnöåşöë^øëœëŞëŞøë¸ÛÍ¶Û÷İ­´éîŸÛN<ç½´ïn¹ï~¹ïœÛN¼ë^œï´ëë®Ÿïn·ë¸Ùî\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÛİÛÑ­=ÓŞİÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş5çÎ=åşvãwç5çnxİ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéÎŸë~›ÛİÛÑ­=ÓŞ½ë­´ÛÎµïŸéŞ½ë~_ïn¹ë^¸ÛÍºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıéşúëöë®œéşûåş÷ïµï¹ÛİÓİ=Óİµİİ´ãÎ5áÎxåş9áî:áşvã~9ã½ÛNÛÑ­=Óİ=ïn·ÛMİÛNï~åş½ï~ôåş÷ïµï÷åşöë÷ïµïnøÛÎúë®¹åş¸ëúÛİÛÑ­=Óİ=ïn·ßm´İİ´éŞ÷éŞ_ëŞ÷ïN_ë^üëŞ_ïn¹ï~øë^öï¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=Óİ=ëŞºÛM¼Û^öë}´Û­ºÛNöë}öÛİÓİ=Óİ=ïn·ÛMİÛNöë}öİ½Óİ=íİ´ëœï~¹ÛNÛÑ­=Óİ=ïNöåş¹ïnöåşöë^øëœëŞëŞøë¸ÛÍ¶Û÷İ­´éîŸÛN5çÎ=ÛNöë÷ïµïnøÙÍ´ëÎµéÎøÛN¹éîºéşöë~¹ëåÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åı½İ½Óİ=íİÓİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéÎŸë~›ÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş=áîtçxåş7ã®;İ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåş·ë®»åş½éîôïøÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ã^<ãn_ã~á¾_ã~:ã½ÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ë^¼ën_ë~œé¾_ë~ºë½½Ñ­=Óİ=ïn·ÛMİÛNúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ë^¼ën_ë~œé¾_ë~ºë½¼Ñ­=Óİ=Óİ=ÓŞúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=ëœï~¹Ñ­=Óİ=ïn·ÛMİÛMãçNáşxç~yçNtİ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ç~9ç_ãyã^åş<ç¾_áŞ5ç~xãvåşwáÎ5ç®9İ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåş÷ëøåş¸ïµéÎ_ãÎ{åşë^÷ï¹ïn_ï~œë^úë_éŞŸë¹ÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ãyã^åş<ç¾_áŞ5ç~xãvåşwáÎ5ç®9åşwçŞã}ÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ëùë^œåş¼ï¾_éŞµï~øëöåş÷éÎµï®¹åş÷ïŞë}¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş8ç5áÎ_ãÎ{åşçNåşáş8ãÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ë^¶åş½ën_ïôëµï¹åşœïNåşéş¸ë¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş:ãxã~<åş9áî;åşwç5çnxİ­ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåşã^tåş6ç:åşwç5çnxåş:ãÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ï~øë^öï_ë®¹ï·ëÎ_ëë¾½éî¹ÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş:ãxã~<åş9áî;åşçç=åştã^wç~_ç~xã^vçÚÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_áŞ5çN_ãnyã®_ç~xã^vç_áŞyáÎxãŞ_çN5ç~wåş:ãÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ï~øë^öï_ë®¹ï·ëÎ_ëë¾½éî¹åşïœï½åşôë^÷ï}¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåşvã;åşyçN8ã^xã_ã~ãÚÑ­=ÓŞ½ë­´ÛÎµïn»Ûİ´í½Óİ=ÓŞ¹éîùéİ´éŞ÷éŞ_ï®ºë_ëŞïNùï_ï~öë}´ë®öë^ë_ï~öë}´İİÓİ=Óİ=Ù­¼ÛÎ¹éîùéİ´éŞ÷éŞ_ï®ºë_ëŞïNùï_ï~öë}´Ù­½ë^öë½½İ½Óİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ïn¹ë¾_ïôëµï¹ÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=ë®öë^ë_ï~öë}½İ½Óİ=íİÓİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ç~9ç_ç~vã~_ç~xã^xãÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ï~¹ï_ï~öë~_ï~øë^øë¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåşvãuç9ç~xåşwç5çwåşwçvã5áİÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïn¹ï^ùë÷ï_ï~øë^øï~_ï~øïn¹ë^ÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşyáîáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_çn9áÎ9ã^wã_ç~xã^xç~_ç~xçn9ã^İ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåşöëœëµï~¹åş÷ïµï÷åş÷ïöëµéİ¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåş7ã®;åşwç5çwåşwçvã5áİÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ë~ºë¾_ï~øë^øï~_ï~øïn¹ë^ÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşyáîáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_çtã5ç9åşwç5çwåşwçvã5áİÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïôëµï¹åş÷ïµï÷åş÷ïöëµéİ¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåşyçN8ã^xã_ç~xçn9ã^İ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåşùïN¸ë^øë_ë^üëŞ_ï~øïn¹ë^ÛÎúë®¹åş¸ëúÙÍ´ë^öë½½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşyáîáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ç~áŞyåş5çxã^7ãÍÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ï~éŞùåşµïøë^·ëÍ¼ï®ºë_ë¹ï­İî¶ïºåşë¾öÙÍ´ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNç~åşwã_áîç=ã®}åş:çn9ãZãÚÑ­=ÓŞúë®¹åş¸ëúÙİŞëŞ÷ïN_ï~Ÿë®_ë¹ënùë½´İİ´ßMÛÑ­=ÓŞúë®¹åş¸ëúÙİŞëŞ÷ïN_ïnµï½ôåş¸ë¶ï»ÛMİÛMôİ½Óİ=ï®ºë_ë¹ï­İî½ï~ôåşöë^ûß^_ë¹ënùë½´İİ´ßMÛÑ­=ÓŞúë®¹åş¸ëúÙİŞëŞ÷ïN_ïnµï½öåş¸ë¶ï»ÛMİÛMôİ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNç~åşwã_çáîç=ã®}åş:çn9ãZãÚÑ­=ë~µï~¹ÛNç~åşwã_ç~<çxãç¾İ­Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ãyã^åşwçŞã~_ã~:ã½ÚÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞúë®¹åş¸ëúÙİŞëùë^œåşúë®¹åş÷ïŞë~_ëë^¶éÎ¹ÛMİÑ­=Óİ=Ù­¼ÛÎùëŞï÷ßn_ï´Ù­½ë^öë½½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ãyã^åşwçŞã~_ã~:ã¾_ç®9çmöİ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåş÷ëøåş¸ïµéÎ_ï®ºë_ï~ıéî·åşéş¸ë¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åş=ç~tåşã^áşwã7åşxãŞãwç5áŞtİ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåşë^éş_ï~¹ë~_ï½éŞ¹ï~øë^ïM¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ¸ëºë^ùéÎøİ­Óİ=ïNöåş¹ïnöåşöë^øëœëŞëŞøë¸ÛÍ¶Û÷İ­´ãŞï®µéÎ½ë´ãŞwçM´ë~ŸéŞë^ë´ÛüåÎÛmœÛN_åşºïë~_åıœÑ­=Óİ=Óİ´ÛM´ÛN·éŞ¸ÛİÛÑ­=ÓŞöë}´İİ´ÙŞ9ãŞç®5áÍÛÑ­=íİÓŞöëøïöéí´ïn·İ½íİÑ­Û~½ë®¸ëºÛN7áşã®=ã¾_ã~áŞtã^xÑ®÷ïµï½ë}´éÎŸéî»ÛNï~åş½ï~ôåş½éş·ïœåş·éşïNµï¼ï~øïnùë~øÛNúßœßn_ï~ùën¸ëúÛMšï~¸ÙÍÓŞùéî÷ëŞ»éî¹ë´ëŞï´ë~ëœÛNúéş½ë´Ù®µïn»Ûİí½ÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­´İİ´ï­øéÍöåş»ëøåş÷ï¶ë¹ï®¸ë^øë]¼ï~¸ÛİÛÑ­=éÎŸéî»ÛNöë}´İİ´ßMÛÑ­ÓŞ½ë­´ÛÍµï®ºë_ë¹ï­´íÎÜÛMµï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛN½éîúë^œëŞ¸ÛNôë^öë^ï}´Ûôá¾\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÛNúë®¹åş¸ëúÛİÛÑ­=ÓŞ½ë­´ÛÎúë®¹åş¸ëúÛİÓİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ë´Ûôá¾\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍÓİ=Óİ=åş_áÎ=áî9åş_ÙÍ´ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­ÓŞ÷ï¾½ï·ëÍ´ÛÎ·éŞ¸Ûİ´í½ÓŞ·ë^÷ë´ç®=ã=áş7åşç~åşzã®9åşvã;åş7ã®;åş7áşçN5çÚÛNÛÑ­=ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë~ºë¾_ë~ëöÛNôïnŸë~_ë~ëÛÑ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İîöëµéÎøëŞë_éŞùï¹ïÍ½İ½Óİ=éŞ÷éŞ_ëŞ÷ïN_ë~ŸéŞôë^øåşøéş_ïNöéş·åş·éŞ¸ÛÍºïNöéş·åş·éŞ¸ÙÍÓİ=Óİ¼ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸ßn_ß}öÛMšÛİ´ë^öë½½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåşôïnŸë~_ë~ë¼ï®ºë_ë¹ï­œÛMºïNöéş·åş·éŞ¸ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ç®:ã_çn9ã¾_áÎ=ç~xåş7ã®;åş7áşçN5çÚÛNÛÑ­=ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·åş·éŞ¸åşœëŞ÷ï¼ï®ºë_ë¹ï­œÛNµïn»ÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛNzãŞ8ãŞã~_áŞwáŞ_ãŞwçN_ã~:ã¾_ç~xçn9ã^åşã;ã^7çİÚÛNÛÑ­=ÓİŸÙ­Óİ=ÛMšÛNzëëŸïm´ß}öÙŞ¶ëŞøÛN<ã^ÛN÷ëë÷ÛNøëÎ¹ÛMøÙíıÛMøßënıï¹ÛN7ã®;åşwçvã5áİÓİ=ÛMšÛM¼éîŸÛN¼ï¾_ï~øë^øë½Ùí´ÛNµïn»ÛN¶ïºë®¹ïm´ï¾µï}´ë^œéÎŸë~µï¹ë´ï¾½ï¼ÛNøëÎ¹Ñ­=Óİ´Ù­´ë~µéÎœëöÛ¾÷ÛMøßënıï¹ÛN_ãŞã~_ç~=å®9İ½´ë®Ÿïn›ÛN÷ïöï·ï´éşéÎıÛNµïNôëë÷Ñ­=Óİ´Ù­´ëÎûåş÷ïµï¹ÛNµï´ï¼ë´ïµëŞœÙÍ´ï~ŸÛN·éşôïİ´ï¼ë´ë®½ïn÷ï´ßøÛN¶ïŞøë÷ÛNµéî¸Ñ­=Óİ´Ù­´éÎ¹ë^úë´ëÎûåş÷ïµï¹ÛMİÛN<ç¾_ç~xã^xã_áîáî9ÙíÓİ=ÛMšÙıÓİ=ï~øïnùë~øÛNï~åşúë®¹åşµïÎ½åş÷ïöëµéŞ_ë~ºë¾_ë~ë´ë~ºë¾_ë~ë´İİ´í½ôíİÛÑ­Óİ=éŞ¹éŞ·ïNıÛÍºë~ºë¾_ë~ëœÛNµïn»ÙÍÓİ=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åşúë®¹åşµïÎ½åş÷ïöëµéŞ_ë~ºë¾_ë~ë_ßøÛİ½İ½Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=ïn·ÛMİÛNï~åş½ï~ôåş·ë®»åşµïÎ½åş÷ïöëµéİ¼ï®ºë_ë¹ï­œÛMºë~ºë¾_ë~ë½İ½Óİ=áŞwáŞ_ãŞwçN_ãyã^åşzã®9åşçxã|åşyáîáş7á½¼ï®ºë_ë¹ï­½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ënöëµé½ÛÑ­=íİÓŞ¸ëºë^ùéÎøİ­Óİ=ïn¹ïùïnÛNï~åş½ï~ôåş½éş·ïœåşùéîœéş·é¾¹ë¼ï~¸ÙÍ´ë~ëœÛNµïn»ÛİÛÑ­=íİÑ­=ïn¹ïùïnÛNöë}ÛÑ®İÑ­éÎŸéî»ÛNï~åş½ï~ôåş½éş·ïœÛÎ÷ïöï·ï´ï­øéÍöåş÷ï¶ë¹ï­´Ù®÷ëœÑ­=ïï~½ë¾ë¸ÛN½éîøÛN·éŞ¸ÙÍ´ï®ŸëŞ¸ÛMšë^öë½½Ñ®ÛÑ­=ïn¹ïùïnÛNï~åş½ï~ôåş½éş·ïœåş·éşïNµï¼ï~¸ÙÍ´ë~ëœÛNµïn»ÛİÛÑ®İÑ­·ëœï~¹ÛMŸÙ­´ã~áî:ãŞ;åş7áşçN5ç´Ù­ŸÑ®œéşë½´éŞ÷éŞ_ëŞ÷ïN_ëŞŸë~øéÍ¼ï~øïnùë~øÛNúßœßn_ï~ùën¸ëúÛMšï~¸ÙÍÓŞùéî÷ëŞ»éî¹ë´ëŞï´ë~ëœÛNúéş½ë´Ù®µïn»Ûİí½ÓŞöëøïöéí´éŞ÷éŞ_ëŞ÷ïN_ëŞŸë~øéÎ_ïéÎŸë~›ë¸ÛÎ÷ëœÛN·éŞ¸ÙÍ´ë^öë½½İ½íİÛ~¹éî¸ëŞºÛMŸÙ­´ã~áî:ãŞ;åş7áşçN5ç´Ù­ŸÑ­ï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåş÷ëë_ëÎûåş·éŞ¸ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÑ­=ï~øïnùë~øÛNï~åşúë®¹åşöë»åş·ë®»åş·éŞ¸ÛMšïn¹ë¾_ë~ºë¾_ë~ëœÑ­=ï½éîøß}öåşøÛMšë~ºë¾_ëµïµÙÍ´ï½éîøß}öåşøÛN·éŞ¸åşœëÛİí½ÓŞ½ë­´ÛÍµï®ºë_ë¹ï­´íÎÜÛMµïn¹ë¾_ë~ºë¾_ë~ë½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛNúë®¹åş¸ëúÛM¹ïNÛNöë»åş·ë®»åş·éŞ¸ÛM¹ïNåÎÛmœÛN_åşºïë~_åıœÑ­=Óİ=åş_áÎ=áî9åş_ÙÍ´ï®ºë_ë¹ï­œÛNöë»åş·ë®»åş·éŞ¸ÛİÛÑ­=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=íİÓŞ½ë­´ÛÍ¼ïn¹ë¾_ë~ºë¾_ë~ëİî·éŞ¸åşøïŞôë´Û]İÛNzã®9åş7ã®;åşã^wá½½ÛMºÛ­Óİ=ÛÍµë~ºë¾_ëµïµÛNÜíÍ´Û^·éŞ¸åşœëÛİ½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛN·éŞ¸ÛNøïŞôë´Û¸ÛN·ë®»åş¸ë^øë]´Ûôá½´ë~ë_éÎ¹éí´Û¸åÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ïn¹ë¾_ë~ºë¾_ë~ëİî·éŞ¸åşøïŞôëœÛN·ë®»åş¸ë^øë]œÑ­=Óİ=ë~ë_éÎ¹éí½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­ÓİŸÙ­´ç®µéÎ½ëµï¹ÛN½éîôïøÛNôë^öë^ëøëöï}´Ù­ŸÑ­=ï~ûëŞøë~¼ÛM¼ïn¹ë¾_ë~ºë¾_ë~ëİî·éŞ¸åşøïŞôë½ÛNÛÑ­=ë~µï~¹ÛNzã®9åş{çn=ç9İ­ÓŞ·ë^÷ë´ç®:ã_çn9ã^8İ­ÓŞ·ë^÷ë´ç®:ã_ç¾vãŞxã_áŞ6İ­´í½Óİ=ëŞºÛM¼ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıïn¹ë¾_éşºë®÷ëøÛMŞÑ­=Óİ=ÛÎyãŞç_áŞ5çÍ´Ùİ´ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîœëÛİ½ÛNÜíÍÓİ=Óİ¼ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıïn¹ë¾_éşºë®÷ëøÛM›Ñ­=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîœëÛİ´İíÓİ=ÓŞúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹åş÷ëŞÚë½ÛNÜíÍÓİ=Óİ¼ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîöë»åşŸë®ºï~¹ï´Û­´ßNüß}½Ûİ´í½Óİ=ÓŞôïn_ëöïn_ïnµï¹éÎ½éŞ½ï¹ë¼Ûm¹ï}ÚÛ¸ÛNöë»éşºë®÷ëøÛM¹ë´éÎ¹éí´Û¸ÛNöë÷ÛM¹ë\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍÓİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîöë»åşŸë®ºï~¹ïœÑ­=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıéÎ¹éíœÑ­=Óİ=Óİ¼ï½éîøß}öåşøÛŞúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹åş÷ëŞÚë½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­Óİ=ëŞºÛM¼ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıë~ë_ëµïµåşŸë®ºï~¹ï´İíÓİ=Óİ¼ç=áîxåşã^|ÛMÛNöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıéÎ¹éí½Ûİ´íÎÜÑ­=Óİ=ÛÍ¼ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙî·éŞ¸åş¸ë^øë^_éşºë®÷ëøÛM›Ñ­=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîœëÛİ´İí´ë~ë_éÎ¹éí½Ûİ´í½Óİ=ÓŞôïn_ëöïn_ïnµï¹éÎ½éŞ½ï¹ë¼Ûm¹ï}ÚÛ¸ÛN·éŞ¸åş¸ë^øë^_éşºë®÷ëøÛM¹ë´éÎ¹éí´Û¸ÛN·éŞ¸åşœëÛM¹ë\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍÓİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙî·éŞ¸åş¸ë^øë^_éşºë®÷ëøÙÍÓİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîœëÙÍ´ë~ë_éÎ¹éí½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­ÓŞ·ë^÷ë´ç®:ã_ç¾vãŞxã_ããŞ_ß]úãn=çÚÑ­=ë~µï~¹ÛNzã®9åş{çn=ç9åş8áŞ=åı÷ßn6ãŞxİ­ÓŞ·ë^÷ë´ç®:ã_ç¾vãŞxã_ããŞ_ß­øãn=çÚÑ­=ë~µï~¹ÛNzã®9åşvã5ã_ããŞ_ß]úãn=çÚÑ­=ë~µï~¹ÛNzã®9åşvã5ã_ããŞ_ß}öãn=çÚÑ­=ë~µï~¹ÛNzã®9åşvã5ã_ããŞ_ß­øãn=çÚÛNÛÑ­=ÓŞ½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹ÛMİİİ´ç®:ã_ç¾vãŞxã_ããŞ_ß­øãn=ç´íÎÜÑ­=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİî·éŞ¸åşøïŞôë´İİİÛNzã®9åşvã5ã_ããŞ_ß­øãn=ç½ÛNÛÑ­=Óİ=ëŞºÛM¼ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙî¼ëŞ_ï¶éÎ_éşºë®÷ëøÛMÜİİÓİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎŸåşøënœåşŸë®ºï~¹ï½ÛNÜíÍÓİ=Óİ=ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙî¼ëŞ_ï¶éÎ_éşºë®÷ëøÛMÑ­=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœéş_ï¶éÎ_éşºë®÷ëøÛMµİİÓİ=Óİ=ÛÎ÷ëŞÚëŸë­¼ï½éîøß}öåşøÛİ½Ûİ½ÛNÛÑ­=Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛN¼ëİ´Û¸ÛNœéı´Û¸åÎÛmœÑ­=Óİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍÓİ=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙî¼ëŞ_ï¶éÎ_éşºë®÷ëøÙÍÓİ=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙî¼ëŞ_ï¶éÎ_éşºë®÷ëøÛİÛÑ­=Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=Óİ=íİÓİ=ÓŞ½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÛMÜİİ´ï~½í®¹éşºÛÎùëŞï÷ßn_ï½Ûİ´í½Óİ=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´éÎ¹éí´Û¸åÎÛmœÑ­=Óİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍÓİ=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÛİÛÑ­=Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=Óİ=íİÓİ=ÓŞ½ë­´ÛÍ¼ÛÎyãŞç_áŞ5çÍ´ÙİÓİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıëÎ½åşøënœåşŸë®ºï~¹ï½ÛMÜÑ­=Óİ=Óİ¼ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎ¹éí´ÙİÓİ=Óİ=ï~½í®¹éşºÛÎùëŞï÷ßn_ï½Ûİ½ÛNÜíÍÓİ=Óİ=ÛÍ¼ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıëÎ½åşøënœåşŸë®ºï~¹ï´Ù½Óİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎ¹éí´ÙİÓİ=Óİ=ï~½í®¹éşºÛÎùëŞï÷ßn_ï½Ûİ´İí´ë~ë_éÎ¹éí½Ûİ´í½Óİ=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ëÎ½åşøënœåşŸë®ºï~¹ï´Û¸ÛNœëÛM¹ë´ë~ë´Û¸åÎÛmœÑ­=Óİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍÓİ=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙî¼ëŞ_ï¶éÎ_éşºë®÷ëøÙÍÓİ=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÙÍ´ë~ë_éÎ¹éí½İ½Óİ=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=ÓŞİÑ­=ÓŞİÑ­=ÓŞ½ë­´ÛÍ¼ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎŸåşøënœåşŸë®ºï~¹ï´İíÓİ=Óİ¼ç=áîxåşã^|ÛMÛNöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÛİ½ÛNÜíÍÓİ=Óİ¼ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœéş_ï¶éÎ_éşºë®÷ëøÛM›Ñ­=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎ¹éí½ÛMŞÛN·éŞ¸åşœëÛİ½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´éÎŸåşøënœåşŸë®ºï~¹ï´Û¸ÛNœëÛM¹ë´ë~ë_éÎ¹éí´Û¸åÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÑ­=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœéş_ï¶éÎ_éşºë®÷ëøÙÍÓİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎ¹éíœÛN·éŞ¸åşœëÛİÛÑ­=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=íİÓİ=ënöëµé½ÛÑ­=íİÑ­=ë¹ë®µïœïÚÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­ÓŞ÷ï¾½ï·ëÍ´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹Ûİ´í½ÓŞ·ë^÷ë´ç®:ã_ç¾vãŞxãÚÛNÛÑ­=ÓŞï~åş·ë^ëöë^_ëŞŸåşëë~ôïİ¼ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıïn¹ë¾_éşºë®÷ëøÙÍÓİ=ÓŞ·ë®»åş¸ë^øë]´Ù½´ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙî·éŞ¸åş¸ë^øë^_éşºë®÷ëøÙıøÙÍÓİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıéÎ¹éí½İ½Óİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ç®:ã_ç¾vãŞxã_áŞ6İ­´í½Óİ=éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_éŞ¹éŞ·ïNıåşëm¼ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıïn¹ë¾_éşºë®÷ëøÙÍÓİ=ÓŞ·ë®»åş¸ë^øë]´Ù½´ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙî·éŞ¸åş¸ë^øë^_éşºë®÷ëøÙıøÙÍÓİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıéÎ¹éí½İ½Óİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ç®:ã_ã~:ã¾_áŞ5ç~İ­´í½Óİ=ï½éîøß}öåşøÛNøëïMÛÑ­=ÓŞ¶éşŸéÍ´ë¾öë^¶åşœéş·é½ÛÑ­=ÓŞùéî÷ëŞ»éî¹ë´éÎŸéî»ÛNºéÎµë¾÷İ½Ñ­=ÓŞ½ë­´ÛÍ¼ç=áîxåşã^|ÛMÛN÷ëŞÚëŸë­¼ï¹éŞôÛİ´İÍÓİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïéŞµï~›åş½éîºéıïn¹ë¾_éşºë®÷ëøÛİ´íÎÜÑ­=Óİ=ÛÎúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹åş÷ëŞÚë´İÍÓİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïéŞµï~›åş½éîºéıïn¹ë¾_éşºë®÷ëøÛM›Ñ­=Óİ=ï~½í®¹éşºÛÎøëïM½Ûİ´íÎÜÑ­=Óİ=ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞïéŞµï~›åş½éîºéıïn¹ë¾_éşºë®÷ëøÛMºÛMôïÍ÷Ûİ½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ç®:ã_ã~:ã¾_áŞ5ç~İ­´ãŞï®µéÎ½ë´éÎ¹éî»ï¼åÎÛmœÛN_åşºïë~_åı½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­=ÓŞ»ïnµën_éÎŸë~›ÛMİÑ­=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ñ­=Óİ=ÓİëŞ÷åşéş¸ïœë_ë~ºë¾_éÎŸë~›åşë¹ë¹ë¼Ñ­=Óİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîë^÷é¾_ëŞë®ŸÙîöë»åşŸë®ºï~¹ï½İ½Óİ=ëŞºÛM¼ë¾öë^¶åşœéş·é½½Ñ­=Óİ=ï~ôëŞåşœéş·é¾_ëŞöï^÷ë^úë¼Û®úë®¹åş¸ëúÙİŞï~¼ë^öë¸åş¸ë^øë^_éÎŸë~›ÙÍ´ë®œë^»ï}½İ½Óİ=ëœï~¹Ñ­=Óİ=åş_ë^·ï^ùëŞöë¼Û®úë®¹åş¸ëúÙİŞï~¼ë^öë¸åş¸ë^øë^_éÎŸë~›ÛİÛÑ­=ÓŞøëïM´İİ´éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ïm¼ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïéŞµï~›åş½éîºéıïn¹ë¾_éşºë®÷ëøÛİÛÑ­Óİ=ï¹éŞôÛMºİİ´íîöë»åş·ë®»åş·éŞ¸ÙİŞïéŞµï~›åş½éîºéıéŞµï~›İ½Óİ=ï¹éŞôÛNÜİİ´ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîë^÷é¾_ëŞë®ŸÙîúë^œİ½Óİ=éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ï½¼ï¹éŞôÙÍ´ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïéŞµï~›åş½éîºéıïn¹ë¾_éşºë®÷ëøÛİÛÑ­=ÓŞ½ë­´ÛÎ»ïnµën_éÎŸë~›ÛİÓİ=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Û®úë®¹åş¸ëúÙİŞï~¼ë^öë¸åş¸ë^øë^_éÎŸë~›ÙÍÓİ=Óİ=ë®œë^»ï}½İ½Óİ=ëœï~¹Ñ­=Óİ=åş_ïn¹éÎ¹ë^÷ë¼Û®úë®¹åş¸ëúÙİŞï~¼ë^öë¸åş¸ë^øë^_éÎŸë~›ÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛNzã®9åş{çn=ç9åş8áŞ=åıõß®6ãŞxİ­ÓŞ·ë^÷ë´ç®:ã_ç¾vãŞxã_ããŞ_ß}öãn=çÚÑ­=ë~µï~¹ÛNzã®9åş{çn=ç9åş8áŞ=åıúß6ãŞxİ­´í½Óİ=ëŞï´ëİÛÑ­=ÓŞùëŞï÷ßn_ï´Ù®¼ëŞ_ï¶éÎ_ïNøïm´İİ´áîyáÎÙÍ´Ù®œéş_ï¶éÎ_ïNøïm´İİ´áîyáÎİ½Óİ=ï½éîøß}öåşøÛN¼ëŞ_ï®µéÍœÛNœéş_ï®µéÍœÛNœéş_ï®µéÍõİ½Ñ­=ÓŞ½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹ÛMİİİ´ç®:ã_ç¾vãŞxã_ããŞ_ß­øãn=ç½ÛNÛÑ­=Óİ=ëÎ½åşøënœåşôïöÛMİÛN·ë®»åş¸ë^øë]´Ù½Óİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıëÎ½åşøënœåşŸë®ºï~¹ïŸßÛÑ­=ÓŞİÑ­=ÓŞœéş_ï¶éÎ_ïNøïm´İİ´ë~ºë¾_ëµïµÛM›Ñ­=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎŸåşøënœåşŸë®ºï~¹ïŸßÛÑ­=ÓŞ½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹ÛMİİİ´ç®:ã_ç¾vãŞxã_ããŞ_ß­øãn=ç½Ñ­=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎ¹éí´İİÓİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıéÎ¹éí´Ùı´ßmÛÑ­=ÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛNöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÙıøİ½´ëİ›Ù½½ÛNÛÑ­=Óİ=éÎŸåşúë^œÛMİÛMšéÎŸåşøënœåşôïöÙ½›İ½Óİ=ÓŞ½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹ÛMİİİ´ç®:ã_ç¾vãŞxã_ããŞ_ß]úãn=ç½ÛNÛÑ­=Óİ=ÓŞœéş_ï®µéÍõÛMİÛNœéş_ï®µéÍ´Û­´ßNüßMôßMôã®:ã®:İ½Óİ=Óİ=éÎŸåşúë^œÛMİÛM¼éÎŸåşúë^œÛMºÛMôïÎ:ã®:ã­ôßMôßM½İíŞß]úİ½Óİ=Óİ=éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ï½¼éÎŸåşúë^œß]œÛNúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹ÛM›Ñ­=Óİ=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞëëŞ_ïn¹ë¾_éşºë®÷ëøÛM›ÛMôïÍøÛİÛÑ­=Óİ=íİ´ëœï~¹ÛN½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹ÛMİİİÓİ=Óİ=Óİ´ÛM´ç®:ã_ç¾vãŞxã_ããŞ_ß­øãn=ç½ÛNÛÑ­=Óİ=ÓŞœéş_ï¶éÎ_ïNøïm›Ù½ÛÑ­=Óİ=ÓŞ¼ëŞ_ï®µéÍ´İİ´Ù®¼ëŞ_ï¶éÎ_ïNøïmÛÑ­=Óİ=ÓŞ¼ëŞ_ï¶éÎ_ïNøïm´İİ´ëÎ½åşøënœåşôïöÛM›ÛMöİ½Óİ=Óİ=éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ï½¼ëÎ½åşúë^œÙÍ´ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=Óİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİî¸éŞ½åşöë»åşŸë®ºï~¹ï½İ½Óİ=ÓŞİÑ­=Óİ=éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ï½¼éÎŸåşúë^œÙÍ´ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞëëŞ_ïn¹ë¾_éşºë®÷ëøÛM›ÛMôïÍøÛİÛÑ­=ÓŞİÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛNzã®9åşvã5ã_ããŞ_ß]úãn=çÚÑ­=ë~µï~¹ÛNzã®9åşvã5ã_ããŞ_ß}öãn=çÚÑ­=ë~µï~¹ÛNzã®9åşvã5ã_ããŞ_ß­øãn=çÚÛNÛÑ­=ÓŞ½éîøÛN½İ½Óİ=ï½éîøß}öåşøÛMšëÎ½åşøënœåşôïöÛMİÛNçáÍœÛMšéÎŸåşøënœåşôïöÛMİÛNçáÍÛÑ­=ÓŞùëŞï÷ßn_ï´ëÎ½åşúë^œÙÍ´éÎŸåşúë^œÙÍ´éÎŸåşúë^œß]ÛÑ­Óİ=ëŞºÛM¼ïn¹ë¾_ë~ºë¾_ë~ëİî·éŞ¸åşøïŞôë´İİİÛNzã®9åşvã5ã_ããŞ_ß­øãn=ç½ÛNÛÑ­=Óİ=ëÎ½åşøënœåşôïöÛMİÛN·ë®»åş¸ë^øë]´Ù½Óİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙî¸éŞ½åş½éîºéıëÎ½åşøënœåşŸë®ºï~¹ïŸßÛÑ­=ÓŞİÑ­Óİ=éÎŸåşøënœåşôïöÛMİÛN·ë®»åş¸ë^øë]´Ù½Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœéş_ï¶éÎ_éşºë®÷ëøÙıøİ½Ñ­=ÓŞ½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹ÛMİİİ´ç®:ã_çn9ã^8åş8áŞ=åıúß6ãŞxÛİÓİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÛMİÑ­=Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÛMŸÛMöİ½Ñ­=ÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛNöë»åş·ë®»åş·éŞ¸ÙİŞïëëŞ_ëŞë®ŸÙîœëÙıøİ½´ëİ›Ù½½ÛNÛÑ­=Óİ=éÎŸåşúë^œÛMİÛNï~åş·ë^ëöë^_ëŞŸåşöÛÎúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹ÛM›Ñ­=Óİ=Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞëëŞ_ïn¹ë¾_éşºë®÷ëøÛM›ÛMôïÍøÛİÛÑ­Óİ=ÓŞ½ë­´ÛÎöë»åş·ë®»åş·éŞ¸ÙİŞë~ë_ïıïN¹ÛMİİİ´ç®:ã_çn9ã^8åş8áŞ=åıõß®6ãŞxÛİ´í½Óİ=Óİ=éÎŸåşúë^œß]´İİ´éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ïm¼ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=Óİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİî¸éŞ½åşöë»åşŸë®ºï~¹ï´Ù½´ßNüß½İ½Óİ=Óİ=éÎŸåşúë^œÛNÜİİ´éÎŸåşúë^œß]´İÍÜÛMõß­ÛÑ­=Óİ=íİÓİ=ÓİšéÎŸåşøënœåşôïöÙ½›ÛMİÛNœéş_ï®µéÍÛÑ­=Óİ=ëŞºÛM¼ïn¹ë¾_ë~ºë¾_ë~ëİî·éŞ¸åşøïŞôë´İİİÛNzã®9åşvã5ã_ããŞ_ß­øãn=ç½ÛNÛÑ­=Óİ=ÓŞ¼ëŞ_ï®µéÍ´İİ´éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ïm¼ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=Óİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİî¸éŞ½åşöë»åşŸë®ºï~¹ï½İ½Óİ=Óİ=Ù®¼ëŞ_ï¶éÎ_ïNøïm´İİ´ëÎ½åşúë^œİ½Óİ=Óİ=ëÎ½åşøënœåşôïöÛM›İİ´ßmÛÑ­=Óİ=ÓŞœéş_ï¶éÎ_ïNøïm›Ù½ÛÑ­=Óİ=íİÓİ=íİÓİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ç®:ã_ãÎ{åşyçN8ã^xã_áÎã~İ­´í½Óİ=ï½éîøß}öåşøÛNùïN¸ë^øë_ëŞ¸ÛMİÑ­=Óİ=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİéÎµï~øåşùïN¸ï_ë®öéŞ_ëŞ¸İ½Óİ=ëŞºÛM¼ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİë®öë^ë_ëŞ¸ÛMµİİ´Ù®·ë®»åş¸ë^øë]Óİ=ÓŞÜíÍ´ïôëµï¹åş½ë´İİİÛMšë~ºë¾_ëµïµÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}´ëÎûÛNùïN¸ë^øë´éÎŸë~›ÛNºë^½éÎ¹ë´ë^·ï]´Û¸ÙÍ´ë~ùïm´ëŞ¸ÛM¹ïœÛNœë^÷ï´ëŞ¸ÛM¹ï\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍÓİ=Óİ=Ù®·ë®»åş¸ë^øë]œÑ­=Óİ=ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]ÙîºïnµéŞ¹åş½ëœÑ­=Óİ=ÓŞùïN¸ë^øë_ëŞ¸ÛİÛÑ­=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=íİÓİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ç®:ã_ãÎ{åşyçN8ã^xã_çáÎã~İ­´í½Óİ=ëŞºÛM¼ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİë®öë^ë_ëŞ¸Ñ­=Óİ=Û]İÛMšë~ºë¾_ëµïµÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûn¼ï½´ïôëµï¹ÛNµë~öéş÷ï}´ë®öë^ë´ënŸïëµïnıÙÎ¶ë»ëŞÛN½ë´ÛùÙÍ´ëë´ëŞ¸ÛM¹ë\éí¶ÙÍÓİ=Óİ=Ù®·ë®»åş¸ë^øë]œÑ­=Óİ=ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]ÙîºïnµéŞ¹åş½ë½İ½Óİ=íİÓİ=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİéÎµï~øåşùïN¸ï_ë®öéŞ_ëŞ¸ÛMİÑ­=Óİ=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾zã®9åştãŞ|åıôåİë®öë^ë_ëŞ¸İ½Óİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ç®:ã_çn9ã^8İ­´í½Óİ=ëŞï´ëİÛÑ­=ÓŞùëŞï÷ßn_ï´Ù®¸ë^øë^_ïNøïm´İİ´ë~ºë¾_ëµïµÛM›Ñ­=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙî·éŞ¸åş¸ë^øë^_éşºë®÷ëøÙıøİ½Óİ=ë®Ÿïm´ÛÎ½ÛMİÛMôİ½´ëİ´İÍ´ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîœëÙıøİ½´ëİ›Ù½½ÛNÛÑ­=Óİ=ëŞºÛM¼ÛÎ¸ë^øë^_ïNøïm´İÍ´ë~ºë¾_ëµïµÛİ´íÎÜÑ­=Óİ=Óİ¼ç=áîxåşã^|ÛMŸÛN÷ëŞÚëŸë­¼Ù®¸ë^øë^_ïNøïm½ÛMÜÑ­=Óİ=Óİ´ÛÎ¸ë^øë^_ïNøïm´Ùİ´ë~ºë¾_ëµïµÛİ½ÛNÜíÍÓİ=Óİ=ÛÎ÷ëŞÚëŸë­¼Ù®¸ë^øë^_ïNøïm½ÛMšÛM¼ëµïµåşôïöÛMÛN·ë®»åş¸ë^øë]½ÛMŞİİÓİ=Óİ=ÛN·éŞ¸åşœëÛİ½Ñ­=Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=Óİ=Ù®¸ë^øë^_ïNøïm›Ù½´İİ´éŞ÷éŞ_ë~µéŞ¹ïnµåş½éş_ïm¼ï®ºë_ë¹ï­İîúë®¹åş¶ë^÷ë´Ù½Óİ=Óİ=ïn¹ë¾_ë~ºë¾_ë~ëİîùÙîöï¾_ëŞë®ŸÙîöë»åşŸë®ºï~¹ï½İ½Óİ=ÓŞöë»åş·ë®»åş·éŞ¸ÙİŞïïnûåş½éîºéıïn¹ë¾_éşºë®÷ëøÛM›İİ´ßÛÑ­=ÓŞİÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛN;ãxåşã^|åş7áÎåşvã^xãÚÛNÛÑ­=ÓŞ½éîøÛNöë}´İİ´ßMÛÑ­=ÓŞùéî÷ëŞ»éî¹ë´éÎŸéî»ÛNöë^øëÛÑ­Óİ=ëŞºÛM¼ë~ë_éÎ¹éí´Û]İÛN÷ëŞÚëŸë­¼åş_ï÷ßm½Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛN½éîúë^œëŞ¸ÛN·éŞ¸ÛNœëÛM¹ï´ëüïM´ÛÚï\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ë~ë_éÎ¹éíœÑ­=Óİ=ÓŞ÷ëŞÚëŸë­¼åş_ï÷ßm½ÛİÛÑ­=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=íİÓİ=ïn·ÛMİÛNúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷ÙîôéÎµïºéşöéŞ_éşôï}ë¾¹ï_éŞµïÎ_ë~œé¾_ïnµï¹ÛÍÓİ=Óİ=Óİ=ÓŞúë®¹åş¸ëúÙÍ´Û®öë^øë½İ½Óİ=ëŞºÛM¼ïn·ÛMÜÛMôÛİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛNöë}´Û¸åÎÛmœÛN_åşºïë~_åıœÛN_åşãŞã_åıœÛNöë}½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­Óİ=Ù­¼åş_ï÷ßm´Ù­½ë~ºë¾_ëµïµÛMİÛM¼åş_ï÷ßm½ïnµï¹İ½Ñ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ë~µï~¹ÛN;ãxåş7áÎåşvã^xãwİ­´í½Óİ=ëŞï´ïn·ÛMİÛMôİ½Óİ=ï~øïnùë~øÛNï~åş½ï~ôåş·éÎ›åşöë^øë÷ÛNöë^øë÷İ½Óİ=ï~øïnùë~øÛNï~åş½ï~ôåş·éÎ›åşöë^øë÷ÛMšï÷ëöåş¸ë^øë]´İİÓİ=Óİ¼ï~øïnùë~øÛNï~åş½ï~ôåş·éÎ›åşöë^øë÷ÛMšÛŞ·ë®»åş¸ë^øë]ÛÑ­=ÓŞ½ë­´ÛÎ·éŞ¸åşœëÛMµİİ´ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ë~œé¾_ïnµï¹ï}½Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛN½éîúë^œëŞ¸ÛN·éŞ¸ÛNœëÛM¹ï´ëüïM´ÛÚï\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ë~ë_éÎ¹éíœÑ­=Óİ=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åş½ï~ôåş·éÎ›åşöë^øë÷Ûİ½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­=ÓŞöë}´İİ´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ïNœë^øë®ŸïnåşŸïN÷Ùî»ëøåş·éÎ›åşöë^øë÷ÛÍÓİ=Óİ=Óİ=ÓŞúë®¹åş¸ëúÙÍ´Û®öë^øë÷ÛİÛÑ­=ÓŞ½ë­´ÛÎöë}´İÍ´ßM½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ë®µëŞœë¸İ­´ïn·ÛM¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ïn·ÛİÛÑ­=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=íİÓİ=ï÷ëöåş¸ë^øë]İî÷ï®÷åşöë^øë´İİ´ïnµï¹ï}ï~úï~_ïnµï¹İ½Óİ=ï÷ëöåş¸ë^øë]İîéşëŞë^œåşöë^øë´İİ´ïnµï¹ï}éîŸéŞ½éîµéÎ_ïnµï¹İ½Óİ=ï÷ëöåş¸ë^øë]İî¼ëŞ»ëÎ_ïnµï¹ÛMİÛNöë^øë÷Ùî¼ëŞ»ëÎ_ïnµï¹İ½Óİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ã¾9ç_ãŞwçN_ãŞ8İ­´í½Óİ=ï½éîøß}öåşøÛMšëŞ÷ïN_ëŞ¸ÛMİÛNçáÍÛÑ­Óİ=ëŞºÛM¼ë~ë_éÎ¹éí´İÍ´ï~½í®¹éşºÛÎùëŞï÷ßn_ï½Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛN½éîúë^œëŞ¸ÛN·éŞ¸ÛNœëÛM¹ï´ëüïM´ÛÚï\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ë~ë_éÎ¹éíœÑ­=Óİ=ÓŞ÷ëŞÚëŸë­¼ï½éîøß}öåşøÛİ½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­Óİ=ëŞ÷ïN_ëŞ¸ÛMİÛM¼ï½éîøß}öåşøÛMšÛŞ·ë®»åş¸ë^øë]ÛÑ­=ÓİšëŞ÷ïN_ëŞ¸ÛMİÛNúë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸İ½Óİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ç~9ç_ç¾åşyãn_ç~=å®9İ­Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNwãxåşyãn_çNáÎ=ã~}İ­´í½Ñ­=ÓŞ½ë­´ÛÎ·éŞ¸åşœëÛMÜÛN÷ëŞÚëŸë­¼ï®ºë_ë¹ï­İîúë®¹åşùën_ïNŸéÎ½ë~ıÛİ½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ë®µëŞœë¸İ­´ëŞï®µéÎ½ë´ë~ë´éÎ¹éí´ÛùÛN¹ïÎôÛM¹í®ùåÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÛN·éŞ¸åşœëÙÍÓİ=Óİ=ï~½í®¹éşºÛÎúë®¹åş¸ëúÙİŞï®ºë_ï¶åşôéşœëŞ·ïİ½ÛİÛÑ­=Óİ=ïn¹ïùïnÛMã=áîzã^İ½Óİ=íİÓİ=ï®ºë_ë¹ï­İîúë®¹åşùën_ïNŸéÎ½ë~ıÛMİÛMšë~ºë¾_ëµïµİ½Óİ=ënöëµé½ÛÑ­=íİÓŞ·ë^÷ë´ã¾9ç_ç®:ã_ãÎ{åşãŞãŞxİ­´í½Óİ=ï½éîøß}öåşøÛMšëÎûåşœëŞëŞøÛMİÛNçáÍÛÑ­Óİ=ëŞºÛM¼ë~ë_éÎ¹éí´İÍ´ï~½í®¹éşºÛÎùëŞï÷ßn_ï½Ûİ´í½Óİ=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸ÛNºë^½éÎ¹ëÚÛN½éîúë^œëŞ¸ÛN·éŞ¸ÛNœëÛM¹ï´ëüïM´ÛÚï\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ë~ë_éÎ¹éíœÑ­=Óİ=ÓŞ÷ëŞÚëŸë­¼ï½éîøß}öåşøÛİ½İ½Óİ=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ÓŞİÑ­Óİ=ëÎûåşœëŞëŞøÛMİÛM¼ï½éîøß}öåşøÛMšÛŞ·ë®»åş¸ë^øë]ÛÑ­=ÓİšëÎûåşœëŞëŞøÛMİÛNúë®¹åş¸ëúÙİŞï®ºë_ëÎûåşœëŞëŞøİ½Óİ=ënöëµé½ÛÑ­=íİÓŞİÑ­=ïn¹ïùïnÛMôİ½íİÑ®½éîøÛNï~åş½ï~ôåşôïnŸë~_ë~ë¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍ´ï®ŸëŞ¸ÛMšë^öë½½Ñ®ÛÑ­=ëŞï´ïn·ÛMİÛMôÙÍ´ëİÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş·ë®»åş·éŞ¸ßm´Ù®ôïnŸë~_ë~ë´İİ´ë^öë½ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşöë»åş·ë®»åş·éŞ¸ÛMšïn¹ë¾_ë~ºë¾_ë~ë´İİ´áîyáÎİ½ÓŞùëŞï÷ßn_ï´Ù®·ë®»åş¸ë^øë]´İİ´áîyáÎİ½Ñ­=ëŞºÛM¼ïNöéş·åş·éŞ¸ÙİŞéîùéŞ_ë~ºë½´İí´ßM´Û­ºÑ­=Óİ=ïNöéş·åş·éŞ¸ÙİŞéîùéŞ_ë~ºë½´İÍİÛNyãŞçõß®_áŞ5çÍ½ÛNÛÑ­=ÓŞöë»åş·ë®»åş·éŞ¸ÛMİÛN›ë~µéÎœéş·ÛÎôïnŸë~_ë~ëİîïåş·ë®»ÙÍÓİ=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åşúë®¹åşöë»åş·ë®»åş·éŞ¸ÛİœÛN;ã®tåşãváî9áÍ½İ½Óİ=ëŞºÛM¼Û^öë»åş·ë®»åş·éŞ¸Ûİ´í½Óİ=ÓŞöë}´İİ´ÙŞ9áîáŞ9áİÛÑ­=Óİ=ë¾ŸïŸÛNöë»åş·ë®»åşºë^½éÎ¹ëÛÑ­=ÓŞİÑ­Óİ=ëŞºÛM¼ë~ŸïNıåşºïnŸéŞ_ï÷ëöÛÎöë»åş·ë®»åş·éŞ¸ÙÍÓİ=Óİ¼ï®ŸëŞ¸ÛN_åşùï~¹ïm´Ù­½ÛÎôïnŸë~_ë~ëİî·ë®»åş·éŞ¸ÛİœÑ­=Óİ=ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ïn¹ë¾_ë~ºë¾_ë~ë½Ñ­=Óİ=ÓİšÛNôïnŸë~_ë~ëİîïåş·ë®»Ûİ½ÛNÛÑ­=Óİ=ïn·ÛMİÛMã:ã^yáÎxİ½Óİ=ÓŞ»éşøéı´ë~ŸïNıåş·éŞ¸åşºë^½éÎ¹ëÛÑ­=ÓŞİÑ­=íİ´ëœï~¹ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛNtë^÷ï~¹ë´éîùéŞ_ë~ºë½´ë^÷ÛMôåÎÛmœÛN_åşºïë~_åı½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­=ëŞºÛM¼ïNöéş·åş·éŞ¸ÙİŞë~ë_éÎ¹éí´İí´ßM´Û­ºÑ­=Óİ=ïNöéş·åş·éŞ¸ÙİŞë~ë_éÎ¹éí´İÍİÛNyãŞçõß®_áŞ5çÍ½ÛNÛÑ­=ÓŞ·ë®»åş¸ë^øë]´İİ´éŞ¹éŞ¸ïôåşùï~¹ïm¼ÛÎúéş½ë´åş_ï÷ëöÛMšÛİ¼ïNöéş·åş·éŞ¸ÙİŞë~ºë¾_ëµïµÛİœÑ­=Óİ=ïNöéş·åş·éŞ¸ÙİŞë~ë_éÎ¹éí½İ½Óİ=ëŞºÛM¼ãŞwåş9çnvÛÎ·ë®»åş¸ë^øë]½Ûİ´í½Óİ=ÓŞ›ë®öë¹ÛÎöë»åş·ë®»åş·éŞ¸ÛİÛÑ­=Óİ=ïn¹ïùïnÛNtçvåş9çnvÛÎ·ë®»åş¸ë^øë]½İ½Óİ=íİÓŞİÛN¹éÎ÷ë´í½Óİ=ïNöåş¸ë¶ï»ÛÍ¶Û÷İ­´çNµï~÷ë¸ÛN·éŞ¸åşœëÛNµï}´ßN\éí¶ÙÍ´åş_ë®ùéî·åş_ÛİÛÑ­=íİÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛNôïnŸë~_ë~ëİîïåş·ë®»İ½´ëİ›Ù½½Ñ­=ÓŞöë}´İİ´éŞ÷éŞ_ëŞ÷ïN_ï~¹éî¸åş¼ï¾_ë~ë¼ï®ºë_ë¹ï­œÛMºïn¹ë¾_ë~ºë¾_ë~ë[ëŞ]ÙÍÓİ=ÓŞ·ë®»åş¸ë^øë]œÛNôïnŸë~_ë~ëİî·éŞ¸åşœëÛİÛÑ­ÓŞ½ë­´ÛÎ·éşôïŞ_ïŸåşùï~¹ïm¼ïNöéş·åş·éŞ¸ÙİŞë~ºë¾_ëµïµÙÍÓİ=ë~ºë¾_ëµïµÙÍ´ïNöéş·åş·éŞ¸ÙİŞë~ë_éÎ¹éí½Ûİ´í½Óİ=ïn·ÛMİÛMã:ã^yáÎxİ½Óİ=ë¾ŸïŸÛN·éşôïŞ_ë~ë_ë®µëŞœë¸İ½ÓŞİÑ­ë~ŸïNıåş·éŞ¸åşºë^½éÎ¹ëÚÑ­=é¾ºïn¹ë¼ë~ºë¾_ëµïµÛİÛÑ®öë»åş·ë®»åşºë^½éÎ¹ëÚÑ­=é¾ºïn¹ë¼ïn¹ë¾_ë~ºë¾_ë~ë½İ½ÓŞöëøïöéí´ïn·İ½íİÑ®½éîøÛNï~åş½ï~ôåş÷ëë_ëúëï¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓŞùëŞï÷ßn_ï´ëúëï_ïıïN¹ÙÍÓŞ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ëúëï_ëµïµÛMšëúëï_ëµïµÛİí½ÓŞ÷ïöï·ï´ï­øéÍöåş¹ï®¹éîøÛN½ï~ôåş¹ï®¹éîøİ½Ñ­=éŞ¹éŞ÷ëøÛÍºëŞ÷ïN_ëúëïœÛMôÙÍ´ï~½í®¹éşºÛÎ÷ïöï·ï´ï­øéÍöåş¹ï®¹éîøÛİ½İ½ÓŞ½ï~ôåş¹ï®¹éîøÙî½ë´İİ´ßMÛÑ­=ëŞ÷ïN_ëúëïïıïN¹ÛMİÛN¹ï®¹éîøåşøïŞôëÛÑ­=éŞ¹éŞ·ïNıÛÍºëŞ÷ïN_ëúëïïëµïµå½ôåİœÛN¹ï®¹éîøåş¸ë^øë]œÑ­=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åş½ï~ôåş¹ï®¹éîøåş¸ë^øë]½ÛİÛÑ­=ï­øéÍöåş¹ï®¹éîøåşõï¹ï¹ÛÎúë®¹åş¸ëúÙİŞï~ùën¸ëúÙî÷ëë¹ï®éş¸ëœÛMºëŞ÷ïN_ëúëï½İ½ÓŞöëøïöéí´ßMÛÑ®İÑ­ëŞï´éŞ÷éŞ_ëŞ÷ïN_ï~¹éî¸åş¹ï®¹éîøåşùïN¸ë^øë_éîµéîŸï~¹ë}¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓŞùëŞï÷ßn_ï´ëúëï_ïıïN¹ÙÍÓŞ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ëúëï_ëµïµåşë^éş÷ë·ÛMšëúëï_ëµïµÛİí½ÓŞ÷ïöï·ï´ï­øéÍöåş¹ï®¹éîøÛN½ï~ôåş¹ï®¹éîøİ½Ñ­=éŞ¹éŞ÷ëøÛÍºëŞ÷ïN_ëúëïœÛMôÙÍ´ï~½í®¹éşºÛÎ÷ïöï·ï´ï­øéÍöåş¹ï®¹éîøÛİ½İ½ÓŞ½ï~ôåş¹ï®¹éîøÙî½ë´İİ´ßMÛÑ­=ëŞ÷ïN_ëúëïïıïN¹ÛMİÛN¹ï®¹éîøåşøïŞôëÛÑ­=éŞ¹éŞ·ïNıÛÍºëŞ÷ïN_ëúëïïëµïµå½ôåİœÛN¹ï®¹éîøåş¸ë^øë]œÑ­=ÓŞ÷ëŞÚëŸë­¼ï~øïnùë~øÛNï~åş½ï~ôåş¹ï®¹éîøåş¸ë^øë^_éîµéîŸï~¹ë}½ÛİÛÑ­=ï­øéÍöåş¹ï®¹éîøåşõï¹ï¹ÛÎúë®¹åş¸ëúÙİŞï~ùën¸ëúÙî÷ëë¹ï®éş¸ëœÛMºëŞ÷ïN_ëúëï½İ½ÓŞöëøïöéí´ßMÛÑ®İÑ­Û~¸ëºëŞë´ã~5áÎ_ç¾çn8ÛÎûëŞ¸ï¼ÙÍ´áİœÛNÛİ´ÛÍ¼ï¾½ëøëÍ´Ù­´áİ´Ù½´áí´Ùİ´ß]½ÛMŸÛNÛİÑ®½éîøÛNï~åş½ï~ôåş·ë^œåşûéşöë_ïN¹ïn_éÎ½éî¹ÛÎùëŞï÷ßn_ï´éşùïôïøåşºéşöéŞµïœÑ­=ï½éîøß}öåşøÛNôëŞüëœåşôëöåşœëŞë½Ñ®ÛÑ­=ëŞï´ï®µéÍ´İİ´Ùİõİ½Ñ­=ï~ûëŞøë~¼ÛM¼éşùïôïøåşºéşöéŞµï½ÛNÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½üİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^6ã¾;çmüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^;çn6ã½üİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_á®tã;İ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşãxã]ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ã¾vã}İ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMõÙÍ´ßÍ½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;ãnvã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~vã¾;ãmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßN8çN7áİúİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]ôãtã~ß­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßN8çN7áİúİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]ôãtã~ß­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßN8çN7áİüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]ôãtã~ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßN8çN7áİüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]ôãtã~ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áŞ9ç5ß]ôİ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMùÙÍ´ß}öÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]öİ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛM÷ÙÍ´ß]úÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]øİ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMûÙÍ´ß}öÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]ôİ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMõÙÍ´ß­½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^6ã¾;çmõßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^;ãnvã½õßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^;çn6ã½õßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^vã¾;ãmõßmÚÑ­=ÓŞúë^œÛMİÛN7ã^åş{áşvã¼ïN½ïÎ¹éÎ_ïN¹ïn_éÎ½éî¹ÙÍ´ß]œÛMùÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]øİ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMõÙÍ´ß½İ½Óİ=ënöëµé½ÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­öß]ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­øß]ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzß]úİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­úß]ÚÑ­=ÓŞúë^œÛMİÛN7ã^åş{áşvã¼ïN½ïÎ¹éÎ_ïN¹ïn_éÎ½éî¹ÙÍ´ß]œÛMüÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ç}ç­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞzçŞyİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşyçŞzçİÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç®}ç}İ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMöÙÍ´ßÍ½İ½ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úãn;ã¾vß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úã¾6çn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úã¾vãn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úçn;ã¾6ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úãn;ã¾vß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úã¾6çn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úã¾vãn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úçn;ã¾6ß]öİ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMõÙÍ´ß½İ½ÓŞ¶ïn¹ë^›İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­ößÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzßöİ­Óİ=ï®µéÍ´İİ´ã~5áÎ_ç¾çn8ÛÎôëŞüëœåşôëöåşœëŞëœÛMõÙÍ´ßÍ½İ½ÓŞ¶ïn¹ë^›İ½Óİ=Ùıšç8İ­´ã^¸ë´éŞŸïn¹ÛN½éŞµë¾¹ÛNºéşöéŞµïšÙıÓŞ¸ëºë^ùéÎøİ­Óİ=éŞ÷éŞ_ëŞ÷ïN_ïNöëŞï_ë®Ÿïöë~·åş¹ïnöéşöÛÎ_åşºïë~_åıœÛNŸïøïNùï_ë®Ÿïnë^øÛİÛÑ­=ÓŞ¶ïn¹ë^›İ½ÓŞİÑ­=ïn¹ïùïnÛNúë^œİ½íİÑ®¹éîùéİ´éŞ÷éŞ_ëŞ÷ïN_ïNµë~›åşºéŞøÛNï~åş½ï~ôåş»ëøåşôë^·é¾_ë®Ÿïnë^øÛÎùëŞï÷ßn_ï´éşùïôïøåşºéşöéŞµï½Ñ®ÛÑ­=ï~ûëŞøë~¼ÛM¼éşùïôïøåşºéşöéŞµï½ÛNÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½üİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;ãnvã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~vã¾;ãmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßN8çN7áİúİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]ôãtã~ß­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßN8çN7áİúİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]ôãtã~ß­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßN8çN7áİüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]ôãtã~ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßN8çN7áİüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]ôãtã~ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;ãnvã½õßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~vã¾;ãmõßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~6ã¾;çmõßÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;ãnvã½õßÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;çn6ã½õßÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~vã¾;ãmõßÚÑ­=ÓŞöëøïöéí´áŞ=çN=İ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^;ãnvã½üİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^vã¾;ãmüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]øİ­Óİ=ïn¹ïùïnÛNuã~áİÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®6ã¾;çmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®;ãnvã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®;çn6ã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®vã¾;ãmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®6ã¾;çmõßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®;ãnvã½õßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®;çn6ã½õßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®vã¾;ãmõßmÚÑ­=ÓŞöëøïöéí´çNã^=áíõß­ÛÑ­=ë¹ë®µïœïÚÑ­=ÓŞï~åş½ï~ôåşôïn½éîøåşºéşùïn·ë~_ëöïnŸïm¼åş_ë®ùéî·åş_ÙÍ´éşùïôïøåşºéşöéŞµï½İ½Óİ=ënöëµé½ÛÑ­=íİÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ®İÑ­ëŞï´éŞ÷éŞ_ëŞ÷ïN_ë¾¹ï_ën½ï_ïN¹ïn_ïN½ïÎ¹éÍ¼ï½éîøß}öåşøÛNŸïøïNùï_ë®Ÿïnë^øÛİí½ÓŞ÷ï¾½ï·ëÍ´ÛÎŸïøïNùï_ë®Ÿïnë^øÛİ´í½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ßÚÑ­=ÓŞöëøïöéí´ßÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çİúİ­Óİ=ïn¹ïùïnÛMúİ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;ãnvã½üİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~vã¾;ãmüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^;ãnvã½üİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç^vã¾;ãmüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşçN9ã½ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áŞ9ç5İ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­õßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzßmõİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­õßÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzßõİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ç®yßõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞzçøßmôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ç}ç­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞ}çzİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ç®}çÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç}ç®}İ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşzçŞyçİÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞyç­øßmöçMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞyç­øß]õçMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çİøß^tİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}çzßøßÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞyç­ùßùİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}çzßúßÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞyç­÷ßmÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çŞyç­øß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}çzßößMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ã¾vã}İ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştã^ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çzßÍÚÑ­=ë~µï~¹ÛNç~åşzßßn_çN=çÎ_ã®ç_áŞ9ç5İ­Óİ=ïn¹ïùïnÛMüİ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vß]ôãtã~ß­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;ãnvã½õßN8çN7áİúİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ß]ôãtã~ß­ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~vã¾;ãmõßN8çN7áİúİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vß]ôãtã~ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~;ãnvã½õßN8çN7áİüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ß]ôãtã~ßÍÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_ç~vã¾;ãmõßN8çN7áİüİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ß]ôİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ß]ôãntã^7á½ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®6ã¾;çmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®;ãnvã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®;çn6ã½õßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çMõß®vã¾;ãmõßMÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áŞ9ç5ß]ôİ­ÓŞ·ë^÷ë´áŞwáŞ_ç­øáÍöåştãŞ|åş:áŞxåşãxã]õßMÚÑ­=ÓŞöëøïöéí´ß]ôİ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåş}ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úãn;ã¾vß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úã¾6çn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úã¾vãn;ß]öİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåştß]úçn;ã¾6ß]öİ­ÓŞ·ë^÷ë´áŞwáŞ_ç­øáÍöåştãŞ|åş:áŞxåşãxã]õßmÚÑ­=ÓŞöëøïöéí´ß]öİ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwãn;ã¾vß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾6çn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwã¾vãn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşwçn;ã¾6ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuãn;ã¾vß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾6çn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuã¾vãn;ß]øİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşuçn;ã¾6ß]øİ­Óİ=ïn¹ïùïnÛMõßÛÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzß]úİ­ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­úß]ÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_çİõß­ÚÑ­=ÓŞöëøïöéí´ß]úİ½ÓŞ·ë^÷ë´ç­øáÍöåştãŞ|åş:áŞxåşç­ößÚÑ­=ë~µï~¹ÛNzßßn_çN=çÎ_ã®ç_áîzßöİ­Óİ=ïn¹ïùïnÛMößÛÑ­=ÓİŸÙ®xãÚÛN5ë¸ÛNéşöë´ëŞë^»ë´ë®Ÿïnë^øÙ­ŸÑ­=ë¹ë®µïœïÚÑ­=ÓŞï~åş½ï~ôåşôïn½éîøåşºéşùïn·ë~_ëöïnŸïm¼åş_ë®ùéî·åş_ÙÍ´éşùïôïøåşºéşöéŞµï½İ½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ãŞï®µéÎ½ë´éşùïôïøÛNºéşöéŞµï´ÛüåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´éşùïôïøåşºéşöéŞµï½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåşùïN¸ë^øë_ëöïnŸïn_ë®öë^ë_ë~Ÿïï¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛİí½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ëöïnŸïn_ëŞë®ŸÛMšëöïnŸïn_ëŞë®ŸÛMİÛMºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıÛÑ­ÓŞ¹ïnöéşöåş½éîºéıİî½éîºéş_ëùéŞôåşºïnµéŞ¹åş·éşùéîøÙ½›İ½íİÑ­ï~øë^øëŞ·ÛN½éîøÛNï~åş½ï~ôåşôïnŸë~¹ï~÷åş½éşéŞùåşôë^»ë_ë®µïœï¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛİí½ÓŞ½éîøÛNöë}´İİ´ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞïNµë¾¹ë®µïœï_ë¹ënùë¾_ë½ï~µënœëÛÑ­=ï½éîøß}öåşøÛN½ïnõåş÷ïµïùï}ôÙÍ´ëŞöï^_ï~øë^øï÷ß]ÛÑ­=ï½éîøß}öåşøÛNŸï®¹ïnºéÎŸï¾_éŞµï~›İ½ÓŞùéî÷ëŞ»éî¹ë´éÎŸéî»ÛN½ïnõåşºéÎµë¾÷İ½Ñ­=ÙıšÛN7ëÎ¹ë~›ÛN½ë­´ë^ïİ´éşúëöë®œéşûÛN¶ëŞøÛN½ï}´ï~¹ï´Ù­ŸÑ­=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî»ëøåşŸï®¹ïnºéÎŸï¾_éŞµï~›ÛÍºéşúëöë®œéşûåşë^÷é½½İ½ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî½ïnõåşŸïN÷Ùîöëµë_ëŞöï^_ï~øë^øï÷ÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=Û®½ïnõåş÷ïµïùï}ôÙÍ´Û®½ïnõåş÷ïµïùï}õÛİÛÑ­=éşúëöë®œéşûåşë^÷é½´Û­İÛN½ïnõåş÷ïµïùï}õİ½ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍÓİ=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî·éşéŞŸéî_ë¹ï®_ëµïµåşœéş·é½œÛN½ïnõåşºéÎµë¾÷ÛİÛÑ­=ëŞºÛM¼éşúëöë®œéşûåşë^÷é½´íÎÜÑ­=ÓŞµïŸéŞ½ë~_ïn¹ë^¸ÛÍºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıéşúëöë®œéşûåş÷ïµï¹Ûİ´Û]İÑ­=Óİ=áîåşç®9çn:áÎç½½ÛNÛÑ­=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Ñ­=Óİ=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî·éşéŞŸéî_ë¹ï®_ëµïµåşœéş·é½œÛN½ïnõåşºéÎµë¾÷ÛİÛÑ­=ÓŞôïn_ëöïn_ïnµï¹éÎ½éŞ½ï¹ë¼Ûm¹ï}ÚÛNŸï®¹ïnºéÎŸï½´ë¹ï¹ë~øë¸ÛN¸ïöëŞë½´ãŞáŞç\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åı½İ½Óİ=ÙıšÛN8éşÛ¾øÛNøïn¹ë^øÛNøëÎ¹ÛNï®¹ïnºéÎŸï½´Ù½´çNµë¾¹ÛNºë^ùéÎøÛN÷ë~¹éîµïn½éı´ë^÷ÛNºë^øë^œÙíÓİ=ÛMšÛN=éî÷ï¹ë^¸ÛNøïnıÛNøéı´ëŸÛNµÛNöë·éşúëöïİÛNyï~½éî»ÛNµéí´ëüëŞ÷ï½éî»ÛN¹ï®¹éîøÛNµï}Óİ=ÛMšÛNµï}´éşôïNŸï~¹ë´ïŸÛN·ïn¹ë^øëŞë½´ë]´éî¹ï½´ëúëïÑ­=Óİ´Ù­ŸÑ­=ÓŞï~åş½ï~ôåş¼ë^œï_ï~¹éî¸åş¹ïnöéşöÛÎúë®¹åş¸ëúÙÍ´ãŞwçN_ãzãç_çN=áî;åştáşã¾_áŞ=ç~ã^xã~<ÛİÛÑ­=íİ´ëœï~¹ÛNÛÑ­=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Ñ­=Óİ=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî·éşéŞŸéî_ë¹ï®_ëµïµåşœéş·é½œÛN½ïnõåşºéÎµë¾÷ÛİÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛ¸åİ´ç®:ã¹ë´ãÎµéî¸éÎ¹ÛNtë^»ë´ë®µïœïµÛNúë®¹åş¸ëúÛM¹ïNåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´åş_áÎ=áî9åş_ÙÍ´ÛNúë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸ÙÍ´ï®ºë_ë¹ï­½İ½Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë^üëŞ_éşôï}ëÎµéÎøÛÎúë®¹åş¸ëúÙÍ´ßM½İ½Óİ=éŞ÷éŞ_ëŞ÷ïN_ëÎµéÎøåş÷ëë_ëöïnŸïm¼ï®ºë_ë¹ï­œÛN=ç~tåş9ç®9áîxåş=áşáŞyåştåş:ã^yáÎxÛİÛÑ­=íİÑ­=ëŞºÛM¼ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞïNµë¾¹ë®µïœï_ë¹ënùë¾_ë½ï~µënœë´İİİÛMôÛİ´í½Óİ=ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞïNµë¾¹ë®µïœï_ë¹ënùë¾_ë½ï~µënœë´İİ´ß]ÛÑ­=ÓŞúë®¹åş¸ëúÙİŞënùë®_éŞ»ïmİîŸïN÷ÙİŞënùë®_éŞ»ïn_ë¹ënùë½¼ï®ºë_ë¹ï­İî¶ïºåşë¾öÙÍÓİ=ÓŞúë®¹åş¸ëúÙİŞïNµë¾¹åşºë^ùéÎøåşµë¸ïm½İ½Óİ=éŞ÷éŞ_ëŞ÷ïN_ïNöëŞï_ïN½éî»åşôéşë¾_ë^¸ëöë÷ï}¼ï®ºë_ë¹ï­œÑ­=Óİ=ï®ºë_ë¹ï­İîôë^»ë_ë®µïœï_ë^¸ëöÛİÛÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷ÙîµïÎ½åşŸïN÷Ñ­=Óİ=Ùîöëµë_ï¾åşôëŞë¾_ïNŸéî»åşµë¸ïm¼ï®ºë_ë¹ï­½İ½ÓŞİÑ­=ïn¹ïùïnÛNöë}ÛÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåşôïnŸë~¹ï~÷åş¹ïnöéşöåş½éîºéı¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛİí½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ëöïnŸïn_ëŞë®ŸÛMšëöïnŸïn_ëŞë®ŸÛMİÛMºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıÛÑ­ÓŞ½ë­´ÛÎ¹ïnöéşöåş½éîºéıİî¹ïnöéşöåş·éşùéîøÛMİİİ´ß]´íÎÜÑ­=ÓİµÛÎ¹ïnöéşöåş½éîºéıİî½éîºéş_ëùéŞôåşºïnµéŞ¹åş·éşùéîøÛM¹ÛMõßMôÛİ½ÛNÛÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ïNöéş·ë÷ï~_ëöïnŸïn_ï~øë^øï÷ÛÍÓİ=Óİ=ï®ºë_ë¹ï­½İ½Óİ=ëöïnŸïn_ëŞë®ŸÙİŞëöïnŸïn_éŞµï~›ßM´İİ´ßMÛÑ­=ÓŞ¹ïnöéşöåş½éîºéıİî¹ïnöéşöåşë^÷é½õÛMİÛMôİ½Óİ=ëöïnŸïn_ëŞë®ŸÙİŞë~µéŞ½ë®_ï~øë^øï÷ÛMİÛMôİ½Óİ=ëöïnŸïn_ëŞë®ŸÙİŞï®½éşœë^øëŞŸéî_ï~øë^øï÷ÛMİÛMôİ½ÓŞİÑ®İÑ­ï~øë^øëŞ·ÛN½éîœëŞë´ï®ŸëŞ¸ÛNï~åş½ï~ôåşùïN¸ë^øë_ëöïnŸïn_ëŞë®ŸÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÑ­=ï½éîøß}öåşøÛN¹ïnöéşöåşë^÷é½ôÙÍ´ï½éîøß}öåşøÛN¹ïnöéşöåşë^÷é½õÛİí½ÓŞúë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÙî¹ïnöéşöåşë^÷é½ôÛNÜİİ´ëöïnŸïn_éŞµï~›ßMÛÑ­=ï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıëöïnŸïn_éŞµï~›ß]´íÍİÛN¹ïnöéşöåşë^÷é½õİ½ÓŞúë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÙî¹ïnöéşöåş·éşùéîøÙ½›İ½íİÑ®½éîøÛNï~åş½ï~ôåşôïnŸë~¹ï~÷åşŸï®¹ïnºéÎŸï¾_ëŞöï]¼Ñ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓŞùëŞï÷ßn_ï´Ù®½ïnõåş÷ïµïùï}ôÙÍ´ï½éîøß}öåşøÛMšëŞöï^_ï~øë^øï÷ß]œÑ­=ï½éîøßÎ_ï´ë®Ÿïn·ë_éşúëöë®œéşûÛİí½ÓŞùëŞï÷ßn_ï´éşúëöë®œéşûåşë^÷é½ÛÑ­=ï½éîøß}öåşøÛN¶ï÷åş¹ïnöÛMİÛMôİ½ÓŞùéî÷ëŞ»éî¹ë´éÎŸéî»ÛNºéÎµë¾÷İ½Ñ­=ÙıšÛN½ë­´ï¼ëöë´ë^öë´éîŸÛNµë~øëŞúë´ï~øïn¹ë^ï}´Ùİ´ëŸÛNéşøÛN÷ïµïnøÛNöë·éşúëöïİ´Ù­ŸÑ­=ëŞºÛM¼Û^úë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙîïåşµë~øëŞúë_ï~øïn¹ë^ÛİÓİ=ïn¹ïùïnÛMôİ½Ñ­=ëŞºÛM¼ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî»ëøåş¶ï÷åş¹ïnöåşë^÷é½½Ñ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ë¾¹ï_ënùï~_ëöïn_éŞµï~›ÛÍÓİ=ÓŞúë®¹åş¸ëúÙÍ´Û®¶ï÷åş¹ïnöÙÍ´ëŞöï^_ï~øë^øï÷ß]½İ½ÓİŸÙ­´áŞµï~›ÛNŸïøÛNµéÎœÛNŸï¼ëöÛN½ïnõï}´ëŞºÛNöë·éşúëöïİ´ëŞ÷ÛN÷ïµïnøë¸ÛMšÙıÓŞ½ë­´ÛÎµïŸéŞ½ë~_ïn¹ë^¸ÛÍºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıéşúëöë®œéşûåş÷ïµï¹Ûİ´Û]İÛNáş_áşzãvã®áş{Ûİ´í½Óİ=ï½éîøß}öåşøÛN¼ë^œï_ïn¹ï~øë^öï_éŞµï~›ßMœÛN¼ë^œï_ïn¹ï~øë^öï_éŞµï~›ß]ÛÑ­Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî»ëøåş¼ë^œï_ïn¹ï~øë^öï_éŞµï~›ÛÍÓİ=ÓİºëÎµéÎøåşöë÷ïµïnøåşë^÷é½ôÙÍ´Û®¼ë^œï_ïn¹ï~øë^öï_éŞµï~›ß]½İ½Óİ=Ù®½ïnõåş÷ïµïùï}ôÛMºİİ´ëÎµéÎøåşöë÷ïµïnøåşë^÷é½ôİ½Óİ=Ù®½ïnõåş÷ïµïùï}õÛMºİİ´ëÎµéÎøåşöë÷ïµïnøåşë^÷é½õİ½Ñ­=ÓŞöëøïöéí´ßMÛÑ­=íİÑ­=ÙıšÛN7ëÎ¹ë~›ÛN½ë­´ë^ïİ´éşúëöë®œéşûÛN¶ëŞøÛN½ï}´ï~¹ï´Ù­ŸÑ­=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî»ëøåşŸï®¹ïnºéÎŸï¾_éŞµï~›ÛÍºéşúëöë®œéşûåşë^÷é½½İ½ÓŞŸï®¹ïnºéÎŸï¾_éŞµï~›ÛMºİİ´Ù®½ïnõåş÷ïµïùï}õİ½Ñ­=ëŞºÛM¼éşúëöë®œéşûåşë^÷é½´íÎÜÛNºéşöë~¹åşŸï®¹ïnºéÎŸï½½ÛNÛÑ­=ÓŞ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ëúëï_ëµïµÛN¹ïnöéşöåş¹ï®¹éîøİ½Óİ=ëŞï´ëİÛÑ­=ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë^üëŞ_ï~¼ë^öë¸åş¸ë^øë]´Ù®µïÎ½åş¸ë^øë]´İİ´Û®úë®¹åş¸ëúÙİŞë^üëŞ_ëµïµİ½Ñ­=ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍÓİ=Óİºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞë~ŸéŞéşåş¸ëúåş¸ë^øë^_éÎŸë~›ÙÍ´ë®œë^»ï}½İ½Ñ­=ÓŞ½ë­´ÛÎµïŸéŞ½ë~_ë~ïNüë~¼ë½¼Û®úë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÙîŸï®¹ïnºéÎŸï¾_ï~øë^øëœÑ­=Óİ=ÓŞáş_áşzãvã®áş{ÙÍ´áşzãvã®áş{åş8ãxã7ç9ã½Ûİ´í½Óİ=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Ñ­=Óİ=Óİ´Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî·éşéŞŸéî_ë¹ï®_ëµïµåşœéş·é½œÑ­=Óİ=Óİ´ë®œë^»ï}½İ½Óİ=ÓŞöëøïöéí´ßMÛÑ­=ÓŞİÑ­Óİ=ëŞºÛM¼ï®ºë_ë¹ï­İîöë÷ëøåşôëë½éî»ÛMİİİ´ß]½ÛNÛÑ­=Óİ=ïNöåş¹ïnöåşöë^øëœëŞëŞøë¸ÛÍ¶Û÷İ­¹ë´éşúëöë®œéşûÛM¹ïÍ´ëùïn½éî»ÛNöë÷ëøåÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÛNŸï®¹ïnºéÎŸï¾_éŞµï~›ÛİÛÑ­=Óİ=ÙıšÛN7éÎ¹ë^öÛNŸï®¹ïnºéÎŸï½´ën½ï÷ÛN÷ëŞë~¹ÛNöë÷ëøÛN½ï}´ïN¹éî¸ëŞë½´Ù­ŸÑ­=Óİ=Ù®½ïnõåş÷ïµïùï}õÛMºİİ´íîŸï®¹ïnºéÎŸï¾_éŞµï~›İ½Óİ=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Ñ­=Óİ=Óİ´Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî·éşéŞŸéî_ë¹ï®_ëµïµåşœéş·é½œÑ­=Óİ=Óİ´ë®œë^»ï}½İ½Óİ=ÓŞöëøïöéí´ßMÛÑ­=ÓŞİÑ­=ÓŞôïn_ëöïn_ïnµï¹éÎ½éŞ½ï¹ë¼Ûm¹ï}ÚÛNúë®¹ÛM¹ë´éşúëöë®œéşûéŞµï~›ÛM¹ïÍœënùï~_ëöïnŸïm´ÛüåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­İîôë¹ï­İî½ëœÛNŸï®¹ïnºéÎŸï¾_éŞµï~›ÙÍ´ënùï~_ëöïm½İ½Óİ=ë®Ÿïm´ÛÎ½ÛMİÛMôİ½´ëİ´İÍ´ë^üëŞ_ëµïµÙİŞëÎûåş½éîºéıİîïåşûéİÛÛN½Ù½›Ûİ´í½Óİ=ÓŞ½ë­´ÛÍµë^üëŞ_ëµïµÙİŞë®öë¹åşûéŞ[ëŞ]ÛİÓİ=Óİ=ë~ŸéîøëŞï¹İ½Óİ=ÓŞ=ç~tåş8ãn;ÛÍ¶Û÷İ®ûéİ´Û¸ÛNµï~÷ëŞ»éî¹ë´ïŸÛN÷ïöëµéİ´ëÎµéî¸éÎ¹ÛM¹ïÎ\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÙÍ´ëİœÛNµïÎ½åş¸ë^øë]İîºïn¹ë_ï¾å¾½åİ½İ½Óİ=íİÓİ=ï®ºë_ë¹ï­İîöë·éşúëöïŞ_ëŞöï]ôåşë^÷é½´İİ´ï®ºë_ë¹ï­İî½ïnõßN_éŞµï~›İ½Óİ=ï®ºë_ë¹ï­İîöë·éşúëöïŞ_ëŞöï]õåşë^÷é½´İİ´ï®ºë_ë¹ï­İî½ïnõß^_éŞµï~›İ½Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî÷ëøåş¼ë^œï_ïn¹ï~øë^öï_éŞµï~›ÛÍÓİ=Óİ=ï®ºë_ë¹ï­½İ½Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë^üëŞ_éşôï}ëÎµéÎøÛÎúë®¹åş¸ëúÙÍ´ßM½İ½Óİ=ÙıšÛNë^÷é½´éşºë­´éşøëÎ¹ïm´ï®ºë´ëŞºÛN¸ïµéÍ´ï®ºë´ëŞ÷ÛNùï~¹ë´Ù­ŸÑ­=ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞëŞ÷åş÷ïNœëŞøÛİ´í½Óİ=ÓŞ½éîøÛNŸï¼ëöåşúë®¹åş½ëÛÑ­=Óİ=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®øëïN_ï®ºëÛÑ­Óİ=ÓŞŸï¼ëöåşúë®¹åş½ë´İİ´ÛÎúë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸ÛMİİİ´ãŞwçN_ç®:ãôÛİ´İıÓİ=Óİ=ãŞwçN_ç®:ãõÛMÚÛN=ç~tåşzã®9ßMÛÑ­=Óİ=ï¹éŞôåşúë®¹ÛMİÛNúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî¸ïµéÎ_ï®ºë_ïn¹ï}İîúë®¹åş¸ëúå½Óİ=Óİ=ÓŞŸï¼ëöåşúë®¹åş½ë]İ½Ñ­=Óİ=ë^øéşëŞ·åş÷ëøÛÍºï¹éŞôåşúë®¹ÙİŞëöïnŸïn_ëŞë®ŸÙîŸï®¹ïnºéÎŸï¾_ï~øë^øëœÑ­=Óİ=ÓŞç®9çn:áÎç¾_ã9ç9ã~xã8ÛİÛÑ­=Óİ=ï¹éŞôåşúë®¹ÙİŞïn¹ë~Ÿï®¹ïnıåş½ïnõßN_éŞµï~›ÛMİÛNøëïN_ï®ºëİî½ïnõßN_éŞµï~›İ½Óİ=ÓŞøëïN_ï®ºëİîöë·éşúëöïŞ_ëŞöï]õåşë^÷é½´İİ´ï¹éŞôåşúë®¹ÙİŞëŞöï]õåşë^÷é½ÛÑ­=Óİ=ï¹éŞôåşúë®¹ÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}Óİ=Óİ=Ùî÷ëøåş¼ë^œï_ïn¹ï~øë^öï_éŞµï~›ÛÎøëïN_ï®ºë½İ½Óİ=ÓŞøëïN_ï®ºëİî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë^üëŞ_éşôï}ëÎµéÎøÛÎøëïN_ï®ºëœÛMôÛİÛÑ­=ÓŞİÑ­Óİ=ÙıšÛNöë÷ëøÛN½ïnõÛN÷ïµïùï}´ï~ŸÛN÷é¾½ïM´ë®ùïnøëÎ¹ïm´ïNöéş·ë÷ï}´Ù­ŸÑ­=ÓİšëŞöï^_ï~øë^øï÷ßM´İİ´ßMÛÑ­=ÓİšëŞöï^_ï~øë^øï÷ß]´İİ´ßMÛÑ­Óİ=ëŞºÛM¼ë^øéşëŞ·åşöëµë¼Û®úë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÙîŸï®¹ïnºéÎŸï¾_ï~øë^øë½Ñ­=Óİ=Û]İÛN<ã^ç_ãã®çn7ã8Ûİ´í½Óİ=ÓŞëï~¹ï¼Û®¹ïnöéşöåş¹ï®¹éîøÙÍ´ßMœÛN÷ëŞÚëŸë­¼ëöïnŸïn_ëúëï½ÛİÛÑ­=Óİ=ëöïnŸïn_ëúëïë®öë^ë_ëŞ¸ÛMİÑ­=Óİ=ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ç®:ã_çN=çÎ_ßN]ÙîºïnµéŞ¹åş½ëÛÑ­=Óİ=ëöïnŸïn_ëúëïïëöïnŸïn_ëŞë®ŸÙî¹ïnöåşøïŞôë´İİÓİ=Óİ=ãŞwçN_ãvçnçn_ãnyç~_áşzãvã®áş{İ½Óİ=ÓŞï~åş½ï~ôåş÷ëë_ëúëï¼ï®ºë_ë¹ï­œÑ­=Óİ=ÓŞ=ç~tåş9ç®9áîxåş9çnváşvÙÍ´Û®¹ïnöéşöåş¹ï®¹éîøÛİÛÑ­=ÓŞİÑ­=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Ñ­=Óİ=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî·éşéŞŸéî_ë¹ï®_ëµïµåşœéş·é½œÑ­=Óİ=ë®œë^»ï}½İ½Óİ=ïn¹ïùïnÛMõİ½ÓŞİÑ­=ïn¹ïùïnÛMôİ½íİÑ®úéş½ë´éŞ÷éŞ_ëŞ÷ïN_ïn¹ï~¹ï_ënùïn÷ï_ë~Ÿïï_ë^ë_ë®öë^ë_ëöéşôÛÍÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÛN÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë^üëŞ_ï~øïn¹ë^ÛMšï~øïn¹ë^åş½éîºéı½Ñ®ÛÑ­=ëŞºÛM¼ï~øïn¹ë^åş½éîºéıİî÷ïµï¹ÛMµİİ´ã^7ç=ç®9ÛNÜíÍÓİ=ï~øïn¹ë^åş½éîºéıİî÷ïöëµéŞ_ïıïN¹ÛMµİİ´ãnyçnwç_ç~xçn9ã^Ûİ´í½Óİ=ïn¹ïùïnİ½ÓŞİÑ­=ëŞºÛM¼ï~øïn¹ë^åş½éîºéıİîïåş¶ïöï~øåş·ë^ôïùïn¹ÛMµİİ´ßM½Ñ­=ÓŞï~åş½ï~ôåşöë÷ëøåşºïnµéŞ¹ëöéşôÛÎúë®¹åş¸ëúÙÍ´ï~øïn¹ë^åş½éîºéı½İ½íİÑ®úéş½ë´éŞ÷éŞ_ëŞ÷ïN_ïNöëôë^öë_ëŞöï^_ë¹ënùë¾_ëŞë®ŸÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÑ­=ï½éîøß}öåşøÛN½ïnõåş÷ïµïùï}ôÙÍ´ï½éîøß}öåşøÛN½ïnõåş÷ïµïùï}õÛİí½Ñ­=ïï~½ë¾ë¸ÛNœéşë½´ë®œë^»ï}ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş½ïnõåş¸ë¶ï»åş½éîºéı´Ù®½ïnõåş¸ë¶ï»İ½ÓŞùëŞïüåşøÛN·ïöïn¹éîøåş½éî¸ëüİ½Ñ­=ï~ôëŞåşœéş·é¾_ëŞöï^÷ë^úë¼Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMÓİ=Ùî·éşéŞŸéî_ë¹ï®_ëŞöï^_ëùéŞôåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ÙıšÛN:ëŞœéÍ´ë~ùïnöëï´ç®:ã´ë¹ënùë½´ëŞë®ŸÛMšÙıÓŞ·ïöïn¹éîøåş½éî¸ëüÛMİÛNúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMë~ùïnöëï_ëŞöï^_ëŞë¹ïÍ´ÛÓİ=Óİ=áŞ5çÎ_ç®:ã_ãŞvç^_ã9ãnyã¾_ãyáŞtåşwãŞZãÛÑ­=ëŞöï^_ë¹ënùë½´İİ´Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMëŞöï^_ë¹ënùë¾[Ñ­=Óİ=ë~ùïnöëï_ëŞë¹ïÎ]İ½ÓŞ½ïnõåş¸ë¶ï»ÙİŞï®ºë_ëŞ¸ÛMİÛNúë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸İ½ÓŞ½ïnõåş¸ë¶ï»ÙİŞë~Ÿïn¹åş½ë´İİ´ï~ïN_ïNöéş·ë÷ï~Ÿïn_ëŞ¸ÛÍ½İ½ÓŞï~åş½ï~ôåş»ëøåşøëŞë÷ïµéŞôÛÍºëŞöï^_ë¹ënùë½İîøï}œÛNúë®¹åş¸ëúÛİÛÑ­=ëŞöï^_ë¹ënùë½İî½ïnõåş÷ïµïùï}ôå¾úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİ´İİ´ëŞöï^_ï~øë^øï÷ßMÛÑ­=ëŞöï^_ë¹ënùë½İî½ïnõåş÷ïµïùï}õå¾úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİ´İİ´ëŞöï^_ï~øë^øï÷ß]ÛÑ­=ëŞöï^_ë¹ënùë½İîôëŞë¾_ïNŸéî»åş÷ïµïùï~[ï®ºë_ë¹ï­İîôë¹ï­İî½ë]ÛMİÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷ÙîµïÎ½åşŸïN÷Ùî»ëøåşôëŞë¾ôéşë¾_ï~øë^øï÷ÛÎúë®¹åş¸ëúÛİÛÑ­=ëŞºÛM¼ï®ºë_ë¹ï­İî½ï~_ï~ôéÎ½ï´Û­ºÑ­=Óİ¼ï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞëùë^œåşúë®¹åşöë÷ÙİŞï®ºë_ë¹ï®[Ñ­=Óİ=Û^úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİ½Ñ­=ÓİºÛ­´ÛÎúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî¸ïµéÎ_ï®ºë_ïn¹ï}İîúë®¹åş¸ëúå½Óİ=Óİµï®ºë_ë¹ï­İîôë¹ï­İî½ë]ÙİŞï®ºë_éşôëåş·éîøÛİ½ÛNÛÑ­=ÓİŸÙ­´ã®½éÎœÛNŸï¼ëöÛNzã®9ÛN¸ë¶ï»ÛN=éîºéı´Ù­ŸÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî½ïnõåşŸïN÷Ùîöëµë_ëŞöï^_ï~øë^øï÷ÛÍÓİ=ÓŞúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî¸ïµéÎ_ï®ºë_ïn¹ï}İîúë®¹åş¸ëúå½Óİ=Óİ=Û^úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİœÑ­=Óİ=Û®½ïnõåş¸ë¶ï»ÙİŞëŞöï^_ï~øë^øï÷ßN[Û^úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİœÑ­=Óİ=Û®½ïnõåş¸ë¶ï»ÙİŞëŞöï^_ï~øë^øï÷ß^[Û^úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİ½İ½Óİ=ëŞöï^_ë¹ënùë½İîôëŞë¾_ïNŸéî»åş÷ïµïùï~[Û^úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİ´İİÓİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷ÙîµïÎ½åşŸïN÷Ùî»ëøåşôëŞë¾ôéşë¾_ï~øë^øï÷ÛÍÓİ=Óİ=ï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞëùë^œåşúë®¹åşöë÷ÙİŞï®ºë_ë¹ï®[Ñ­=Óİ=Óİ=Û^úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİ½İ½ÓŞİÑ­=ï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÙî·ïöïn¹éîøåş½ïnõåş½éî¸ëüÙ½›İ½ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMÓİ=Óİë~ŸéŞéşåş¸ëúåş½ïnõåş¸ïïN_éÎŸë~›ÙÍ´ë®œë^»ï}½İ½íİÑ®úéş½ë´éŞ÷éŞ_ëŞ÷ïN_ïNöëôë^öë_ïµï~›éÎ¹ï_ë¹ënùë¾_ëŞë®ŸÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÑ­=ï½éîøß}öåşøÛN½ïnõåş÷ïµïùï}ôÙÍ´ï½éîøß}öåşøÛN½ïnõåş÷ïµïùï}õÙÍÓŞ÷ïöï·ï´éŞ÷éŞ_ëŞ÷ïN_ï½éŞ¹ï~øë^ïM´ï÷Ûİí½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ëŞöï^_ë¹ënùë¾_ëŞë®ŸÛMšëŞöï^_ë¹ënùë½ÛÑ­=ï½éîøßÎ_ï´ë~ùïnöëï_ëŞë¹ïÍÛÑ­=ïï~½ë¾ë¸ÛNœéşë½´ë®œë^»ï}ÛÑ­ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÑ­=Óİ=Ùî·éşéŞŸéî_ë¹ï®_ïµï~›éÎ¹ï_ëùéŞôåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ë~ùïnöëï_ëŞë¹ïÍ´İİÓİ=ï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÙî·ïöïn¹éîøåşøë^÷é¾œëøåş½éî¸ëüÛM¹Ñ­=ÓŞã^|åşzã®9åş=çnuåş8ã6ç;åş8ççN_ç~=å®9İ½ÓŞ½ïnõåş¸ë¶ï»ÛMİÛMºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÙîøë^÷é¾œëøåş¸ë¶ï»å½Óİ=ÓŞ·ïöïn¹éîøåş½éî¸ëüåİÛÑ­=ëŞöï^_ë¹ënùë½İîúë®¹åş½ë´İİ´ï®ºë_ë¹ï­İîôë¹ï­İî½ëÛÑ­=ëŞöï^_ë¹ënùë½İî·éşöë_ëŞ¸ÛMİÛN÷éŞôåşôïnŸë~¹ï~÷éşöåş½ë¼ÛİÛÑ­=ëŞöï^_ë¹ënùë½İîøï}´İİ´ï÷İ½ÓŞ½ïnõåş¸ë¶ï»ÙİŞëŞöï^_ï~øë^øï÷ßN[ï®ºë_ë¹ï­İîôë¹ï­İî½ë]ÛMİÛN½ïnõåş÷ïµïùï}ôİ½ÓŞ½ïnõåş¸ë¶ï»ÙİŞëŞöï^_ï~øë^øï÷ß^[ï®ºë_ë¹ï­İîôë¹ï­İî½ë]ÛMİÛN½ïnõåş÷ïµïùï}õİ½ÓŞ½ïnõåş¸ë¶ï»ÙİŞïN½éî»åşôéşë¾_ï~øë^øï÷å¾úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİ´İİÓİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë^üëŞ_éşôï}ë¾¹ï_ïN½éî»ïNŸéî»åş÷ïµïùï}¼ï®ºë_ë¹ï­½İ½ÓŞúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMë~ùïnöëï_ïµï~›éÎ¹ï_ëŞë¹ïÍ›Ù½ÛÑ­=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÑ­=Óİ=Ùî·éşéŞŸéî_ë¹ï®_ïµï~›éÎ¹ï_ëùéŞôåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ®İÑ­ï~øë^øëŞ·ÛNúéş½ë´éŞ÷éŞ_ëŞ÷ïN_ëï^ùëùë_ïµï~›éÎ¹ï_ë~ë¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÙÍÓŞùëŞï÷ßn_ï´ëŞöï^_ï~øë^øï÷ßMœÛNùëŞï÷ßn_ï´ëŞöï^_ï~øë^øï÷ß]œÑ­=ï½éîøß}öåşøÛNôëŞë¾_ïNŸéî»åş÷ïµïùï}œÛNùëŞï÷ßn_ï´ëùë^œåş½ïnõåş÷ïµïùï}½Ñ®ÛÑ­=ïï~½ë¾ë¸ÛNœéşë½´ë®œë^»ï}ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşøë^÷é¾œëøåşõï¹ï¹åş·éŞ¸ÛMšï^ùëùë_ë~ë´İİ´áîyáÎİ½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ïµï~›éÎ¹ï´Ù®øë^÷é¾œëøİ½Ñ­=ëŞºÛM¼ï®ºë_ë¹ï­İî½ï~_ï~ôéÎ½ï½Ñ­=ÓŞøë^÷é¾œëøÛMİÛMºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞïµï~›éÎ¹ï÷å¾ã^|åşzã®9åİÛÑ­=ëœï~¹Ñ­=ÓŞøë^÷é¾œëøÛMİÛMºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞïµï~›éÎ¹ï÷å¾úë®¹åş¸ëúÙİŞïN¸ëúÙİŞëŞ¸åİÛÑ­ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ï^ùëùë_ë~ë´İİ´Û®øë^÷é¾œëøÙİŞïµï~›éÎ¹ï_ï^ùëùë_ë~ë[ïµï~›éÎ¹ïİîøë^÷é¾œëøï^_ëŞ¸ïÎ]İ½ÓŞ½ë­´ÛÎõï¹ï¹åş·éŞ¸ÙİŞë~ë_ï÷ë¸Ûİ´í½Óİ=ïNöåş¹ïnöåşöë^øëœëŞëŞøë¸ÛÍ¶Û÷İ­´çµï~›éÎ¹ï´ï^ùëùë´éşúëöë®œéşûİ­´Û¸åÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­İîôë¹ï­İî½ë½İ½Óİ=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ÓŞöëøïöéíÛÑ­=íİÓŞµïŸéŞ½ë~_ë^¸ë¼ß]œÛMºï®ºë_ë¹ï­İî½ïnõåş·éîøÛİÛÑ­=ï^ùëùë_ë~ëİîúë®¹ãŞï¹ïnöïôïwïµïùï}ôÛMİÛN½ïnõåş÷ïµïùï}ôİ½ÓŞõï¹ï¹åş·éŞ¸ÙİŞï®ºë=éîøëöïnùïNøç~øë^øï÷ß]´İİ´ëŞöï^_ï~øë^øï÷ß]ÛÑ­=ï^ùëùë_ë~ëİîúë®¹åşôëŞë¾ôéşë¾_ï~øë^øï÷ÛMİÛNôëŞë¾_ïNŸéî»åş÷ïµïùï}ÛÑ­=ï^ùëùë_ë~ëİî¸ïµéÎúë®¹ãŞï¹ïnöïôï÷ïµïùï}´İİ´ëùë^œåş½ïnõåş÷ïµïùï}ÛÑ­=éŞ÷éŞ_ëŞ÷ïN_ë¾¹ï_ï½éŞ¹ï~øë^ïM¼Û®õï¹ï¹åş·éŞ¸ÙİŞï÷ÙÍ´ï®ºë_ë¹ï­½İ½ÓŞõï¹ï¹åş·éŞ¸ÙİŞë~ë_ï÷ë¸ÛMİÛMõİ½ÓŞõï¹ï¹åş·éŞ¸ÙİŞï®ºë_ë¹ï­´İİ´ï®ºë_ë¹ï­ÛÑ­ÓŞøë^÷é¾œëøÙİŞïµï~›éÎ¹ïõåş½ëüÛMİÛM¼ïµï~›éÎ¹ïİîøë^÷é¾œëøï^_ëŞ¸ïÍ´Ù½´ß]½ÛM¹Ñ­=ÓŞç~åşzã®9åşxã^wá¾ãxç^_ç~=å®9İ½ÓŞœëŞ÷ï_ë^¸ë_ïµëŞœÛÍºï^ùëùë_ë~ëİîœëŞ÷ïœÛMºïµï~›éÎ¹ïİîøë^÷é¾œëøåşõÛİÛÑ­=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ïµï~›éÎ¹ï_ï~·ëÎ¹ëùéÎ¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøÛİÛÑ®İÑ®½ïnõïn¹ïùïnåşøÛNï~åş½ï~ôåşôïnŸë~¹ï~÷åş½ïnõåş¸ïµéÎ_ï~ıéî·ÛÎ½éîøÛN½ïnõåşïÙÍ´ï®ŸëŞ¸ÛMšëµïµÛİí½ÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­´İİ´ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšÛİ´ëµïµİ½ÓŞùëŞï÷ßn_ï´ïN½éî»åşôéşë¾_ï~øë^øï÷İ½ÓŞùëŞï÷ßn_ï´ëùë^œåş½ïnõåş÷ïµïùï}´İİ´ßMÛÑ­ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞëùë^œåşúë®¹åş÷ïŞë~_éŞŸë¹Ûİ´í½Óİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ëŞöï^_éşôï}ë~œëµïn_ëùë^œåş½ïnõåş÷ïµïùï}¼Ñ­=Óİ=ÓŞúë®¹åş¸ëúÙÍ´Û®¸ïµéÎ_ëŞöï^_ï~øë^øï÷ÛİÛÑ­=íİÑ­=ëŞºÛM¼ëùë^œåş½ïnõåş÷ïµïùï}´İİİÛMôÛİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ëŞöï^_éîùéİ´Û¸ÛNzã®9Û¸ÛN¸ïµéÎ_ëŞöï^_ï~øë^øï÷ÛNçáÎ\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åıœÛN½ïnõåşïÙÍ´ï®ºë_ë¹ï­İîôë¹ï­İî½ë½İ½Óİ=ïn¹ïùïnÛN=çnuåş<ã^ãã8İ½ÓŞİÑ­=ïN½éî»åşôéşë¾_ï~øë^øï÷ÛMİÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷ÙîµïÎ½åşŸïN÷Ùî»ëøåşôëŞë¾ôéşë¾_ï~øë^øï÷ÛÎúë®¹åş¸ëúÛİÛÑ­ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî½ïnõåşŸïN÷Ùîôïn¹ïNöéş·ë÷ï~_ë~µéŞ½ë®_ëŞöï]½ÛNÛÑ­=ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞëùë^œåşúë®¹åş÷ïŞë~_éŞŸë¹ÛİÓİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî½ïnõåşŸïN÷Ùîôïn¹ïNöéş·ë÷ï~_ë~µéŞ½ë®_ëŞöï]¼Ñ­=Óİ=ï®ºë_ë¹ï­œÛN¸ïµéÎ_ëŞöï^_ï~øë^øï÷ÛİÛÑ­=íİÓŞï~åş½ï~ôåş¹éîõï¹ï¹åşøë^÷é¾œëøåş·éŞ¸ÛÎúë®¹åş¸ëúÙÍ´ßMœÛMôÙÍÓİ=Óİ=ÓŞôëŞë¾_ïNŸéî»åş÷ïµïùï}œÛN¸ïµéÎ_ëŞöï^_ï~øë^øï÷ÛİÛÑ­=ïn¹ïùïnÛN=çnuåş<ã^ãã8İ½íİëŞöï^öëøïöéî_ï´éŞ÷éŞ_ëŞ÷ïN_ïNöéş·ë÷ï~_ëŞöï]¼ëŞï´ëŞöï^_éîùéİœÛNúéş½ë´Ù®¸ë^øë]½Ñ®ÛÑ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛMİÛM¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù­½ÛN¸ë^øë]ÛÑ­=ï½éîøß}öåşøÛN½ïnõåş÷ïµïùï}ôÙÍ´ëŞöï^_ï~øë^øï÷ß]œÛNôëŞë¾_ïNŸéî»åş÷ïµïùï}ÛÑ­=ï½éîøß}öåşøÛN¹ïnöéşöåşë^÷é½ôÙÍ´ëöïnŸïn_éŞµï~›ß]ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş¼ë^öëûë^öë_ëŞë®ŸÛMšëÎûåş½éîºéıÛÑ­ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî½ïnõåşŸïN÷Ùîöëµë_ë^ë_ë~œëµïn_ëŞöï^_ï~øë^øï÷ÛÎúë®¹åş¸ëúÙÍÓİ=ÓİºëŞöï^_ï~øë^øï÷ßMœÛMºëŞöï^_ï~øë^øï÷ß]½İ½Ñ­=ëŞºÛM¼ÛÎ½ïnõåş÷ïµïùï}ôÛMİİİ´ßM½ÛMºÛ­´ÛÎ½ïnõåş÷ïµïùï}õÛMİİİ´ßM½Ûİ´í½Óİ=ãŞwçN_ã6ã½¼Ûm¹ï}ÚÛN½ïnõåşïÛM¹ë´ç®:ã¹ë´ëŞöï^_ï~øë^øï÷ßM´Û­´ß]´ë^öë´ënŸï¼ÛNçáÎ\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åıœÛN½ïnõåşïÙÍ´ï®ºë_ë¹ï­İîôë¹ï­İî½ë½İ½Óİ=ïn¹ïùïnÛN=çnuåş<ã^ãã8İ½ÓŞİÑ­ÓŞôëŞë¾_ïNŸéî»åş÷ïµïùï}´İİÓİ=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë^üëŞ_éşôï}ë¾¹ï_ïN½éî»ïNŸéî»åş÷ïµïùï}¼ï®ºë_ë¹ï­½İ½Ñ­=ëÎûåş½éîºéı´İİ´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®Ÿİ½Ñ­=ÙıšÛN;ëøÛNøëÎ¹ÛN¸ïµéÍ´ãŞvç]´ï~øë^øï÷ÛN½éí´ëùë^œÛNéş¸ëšÙıÑ­=ëŞºÛM¼ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ëŞöï^_éşôï}ïNöëôïnŸë~¹ï~÷åş·ë^ëŞºåş½ïnõÛİ´í½Óİ=ëŞºÛM¼Û^úë®¹åş¸ëúÙİŞëùë^œåşúë®¹åş÷ïŞë~_éŞŸë¹ÛİÓİ=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî½ïnõåşŸïN÷Ùîôïn¹ïNöéş·ë÷ï~_ë~µéŞ½ë®_ëŞöï]¼Ñ­=Óİ=ÓŞúë®¹åş¸ëúÙÍ´ëŞöï^_ï~øë^øï÷ßM½İ½ÓŞİÑ­=ëŞºÛM¼éŞ÷éŞ_ëŞ÷ïN_ïNöéş·ë÷ï~_éşúëöë®œéşûåş½ïnõÛÎúë®¹åş¸ëúÙÍÓİ=Û®½ïnõåş÷ïµïùï}ôÙÍ´Û®½ïnõåş÷ïµïùï}õÙÍ´ßM½Ûİ´í½Óİ=ÙıšÛN½ë­´éşúëöë®œéşûÛN½éî½ï½ë^øë¸ÛNéı´éî¹ë¸ÛNøéı´ëÎµéî¸éÎ¹ÛNøëÎ¹ÛN½éîøëöïnùïNøï}´Ù­ŸÑ­=ÓŞôïn_ëöïm¼ÛnŸï®¹ïnºéÎŸï½´ïNöéş·ë÷ï~¹ë\éí¶ÛİÛÑ­=ÓŞöëøïöéí´ãŞvç^_ãÎ5áî8áÎ9ãÛÑ­=íİÑ­=ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî»ëøåş¹ïnöéşöåşë^÷é½¼Û®¹ïnöéşöåşë^÷é½ôÙÍÓİ=ÓİºëöïnŸïn_éŞµï~›ß]½İ½ÓŞ¹ïnöéşöåşë^÷é½ôÛMºİİ´ëŞöï^_ï~øë^øï÷ßMÛÑ­=ëöïnŸïn_éŞµï~›ß]´Û­İÛN½ïnõåş÷ïµïùï}õİ½ÓŞ½ïnõåş÷ïµïùï}ôÛMºİİ´íî¹ïnöéşöåşë^÷é½ôİ½ÓŞ½ïnõåş÷ïµïùï}õÛMºİİ´íî¹ïnöéşöåşë^÷é½õİ½ÓŞ½ë­´ÛÍ¼ëöïnŸïn_éŞµï~›ßM´Û]İÛMôÛİ´íÎÜÛM¼ëöïnŸïn_éŞµï~›ß]´Û]İÛMôÛİ½Ñ­=ÓŞï~åş½ï~ôåşùïN¸ë^øë_ëöïnŸïn_ëŞë®ŸÛÎúë®¹åş¸ëúÙÍ´ëöïnŸïn_éŞµï~›ßMœÛN¹ïnöéşöåşë^÷é½õÛİÛÑ­ÓŞ½ë­´ÛÍ¼ëŞöï^_ï~øë^øï÷ßM´İİİÛMôÛİ´Û­ºÛM¼ëŞöï^_ï~øë^øï÷ß]´İİİÛMôÛİ´Û­ºÑ­=Óİ¼Û]¼ÛÍ¼ëöïnŸïn_éŞµï~›ßM´Û]İÛMôÛİ´íÎÜÛM¼ëöïnŸïn_éŞµï~›ß]´Û]İÛMôÛİ½ÛMºÛ­Óİ=ÛNúë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÙî¹ïnöéşöåş·éşùéîøÛMİİİ´ß]½Ûİ½ÛNÛÑ­=ÓŞ=ç~tåş8ãn;ÛÍ¶Û÷İ­´ëöïnŸïn_éŞµï~›ßMŸß]´Û­´ëöïnŸïn_ë~Ÿïï´ë^öë´ï~¹ïµåÎÛmœÛN_åşºïë~_åı½İ½Óİ=ïn¹ïùïnÛN=çnuåş<ã^ãã8İ½ÓŞİÑ­=éŞ÷éŞ_ëŞ÷ïN_ïNöëôë^öë_ëŞöï^_ë¹ënùë¾_ëŞë®ŸÛÎúë®¹åş¸ëúÙÍ´ëŞöï^_ï~øë^øï÷ßMœÛN½ïnõåş÷ïµïùï}õÛİÛÑ­=éŞ÷éŞ_ëŞ÷ïN_ëï^ùëùë_ïµï~›éÎ¹ï_ë~ë¼ï®ºë_ë¹ï­œÛN½ïnõåş÷ïµïùï}ôÙÍ´ëŞöï^_ï~øë^øï÷ß]œÑ­=Óİ=Óİ=ïN½éî»åşôéşë¾_ï~øë^øï÷ÙÍ´ßM½İ½Ñ­=ïn¹ïùïnÛN=çnuåş<ã^ãã8İ½íİÑ®úéş½ë´éŞ÷éŞ_ëŞ÷ïN_ëŸåşøë^÷é¾œëøÛÎùéî÷ëŞ»éî¹ë´éÎŸéî»ÛN¸ë^øë]½Ñ®ÛÑ­=ïï~½ë¾ë¸ÛNœéşë½´ë®œë^»ï}ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşøë^÷é¾œëøÛMšïµï~›éÎ¹ï´İİ´ÛÎ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ïµï~›éÎ¹ï´Ù­½ëµïµİ½ÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åş½ïnõåşŸïN÷ÛMšëŞöï^_éşôï}ÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşøë^÷é¾œëøåşõï¹ï¹åş·éŞ¸ÛMšï^ùëùë_ë~ëÛÑ­=ï~øïnùë~øÛNï~åş½ï~ôåşøëŞë÷ïµéŞôÛNøï}ÛÑ­=ï½éîøß}öåşøÛN½ïnõåş÷ïµïùï}ôÙÍ´ëŞöï^_ï~øë^øï÷ß]œÛNôëŞë¾ôéşë¾_ï~øë^øï÷ÙÍ´ëùë^œåş½ïnõåş÷ïµïùï}ÛÑ­ÓŞûëÎ½éÎ¹ÛM¼ß]½ÛNÛÑ­=ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ÓŞõï¹ï¹åş·éŞ¸ÛMİÛNœëŞ÷ï_ë®½ïn÷ï_ëïöïŞ_éşöåşïœéÍ¼Û®øë^÷é¾œëøÙİŞïµï~›éÎ¹ï_ï]œÑ­=Óİ=ï~øïnùë~øÛNï~åşúë®¹åşøë^÷é¾œëøåşõï¹ï¹åş·éŞ¸ÙÍ´éÎ½ï~øÛİÛÑ­=ÓŞ½ë­´ÛÍµï^ùëùë_ë~ë½ÛNÛÑ­=Óİ=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=Óİ=ënöëµé½ÛÑ­=ÓŞİÑ­=ÓŞœëŞ÷ï_ë¹éÎ_ëŞëŞøÛÍºï^ùëùë_ë~ëİîœëŞ÷ï½İ½Óİ=ï®ºë_ë¹ï­´İİ´ï^ùëùë_ë~ëİîúë®¹åş¸ëúİ½Óİ=ï^ùëùë_ë~ëİî·éŞ¸åşùï~¹ë´İİ´ßMÛÑ­=ÓŞõï¹ï¹åş·éŞ¸ÙİŞï®ºë_ë¹ï­´İİ´áîyáÎİ½Óİ=ëŞöï^_ï~øë^øï÷ßM´İİ´ï^ùëùë_ë~ëİîúë®¹ãŞï¹ïnöïôïwïµïùï}ôİ½Óİ=ëŞöï^_ï~øë^øï÷ß]´İİ´ï^ùëùë_ë~ëİîúë®¹ãŞï¹ïnöïôïwïµïùï}õİ½Óİ=ïN½éî»ïNŸéî»åş÷ïµïùï}´İİ´ï^ùëùë_ë~ëİîúë®¹åşôëŞë¾ôéşë¾_ï~øë^øï÷İ½Óİ=ëùë^œåş½ïnõåş÷ïµïùï}´İİ´ï^ùëùë_ë~ëİî¸ïµéÎúë®¹ãŞï¹ïnöïôï÷ïµïùï}ÛÑ­Óİ=ï÷ÛMİÛNõï¹ï¹åş·éŞ¸ÙİŞï÷İ½Óİ=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÛMİİİ´ßM½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ç®:ã¹ë´éşôëÛN·éîøÛMİÛM¹ëœÛN½ïnõÛM¹ïÍŸÛüåÎÛmœÑ­=Óİ=åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­İîôë¹ï­İî½ëœÛNúë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÙÍÓİ=ÓŞ½ïnõåş÷ïµïùï}ôÙÍ´ëŞöï^_ï~øë^øï÷ß]½İ½Óİ=ÓŞ·éşï½éîùëÛÑ­=ÓŞİÑ­=ÓŞµïŸéŞ½ë~_ï~ùëm¼ß]œÛMºï®ºë_ë¹ï­İî½ïnõåş·éîøÛİÛÑ­=ÓŞï~åş½ï~ôåşôïn¹ïNµïn¹åşøë^÷é¾œëøåş¸ë¶ï»åş½éîºéı¼ï®ºë_ë¹ï­œÑ­=Óİ=ëŞöï^_ï~øë^øï÷ßMœÛN½ïnõåş÷ïµïùï}õÙÍ´ï÷ÛİÛÑ­Óİ=ëŞöï^_éşôï}´İİ´Û®úë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî½ïnõåşŸïN÷İ½Óİ=ëŞöï^_éşôï}İîôïnŸë~¹ï~÷åşöë÷ëøåş½ïnõÛÎúë®¹åş¸ëúÙÍÓİ=ÓŞ½ïnõåş÷ïµïùï}ôÙÍ´ëŞöï^_ï~øë^øï÷ß]½İ½Óİ=ëŞöï^_éşôï}İîôïnŸë~¹ï~÷åş¼ë^œï_ëŞöï]¼ï®ºë_ë¹ï­œÑ­=Óİ=ëŞöï^_ï~øë^øï÷ßMœÛN½ïnõåş÷ïµïùï}õÛİÛÑ­=ÓŞ½ë­´ÛÎµïŸéŞ½ë~_ïn¹ë^¸ÛÍºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıéşúëöë®œéşûåş÷ïµï¹ÛİÓİ=Óİµİİ´áîåşç®9çn:áÎç½½ÛNÛÑ­=Óİ=ãŞwçN_ã6ã½¼Ûm¹ï}ÚÛNvë·éşúëöïİ´ëŞÛNôïnŸë~¹ï~÷ëŞë½œÛN=ë¾éşöë´ãŞvç^÷Û]µÛ^\éí¶ÙÍÓİ=Óİ=åş_ë®ùéî·åş_ÛİÛÑ­=Óİ=ë~ŸéîøëŞï¹İ½Óİ=íİÓİ=éŞ÷éŞ_ëŞ÷ïN_ïNöéş·ë÷ï~_ëöïnŸïn_ëŞë®ŸÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞ½ïnõåşŸïN÷ÙİŞïNöéş·ë÷ï~_ï~øë^øï~_ëŞöï]¼ï®ºë_ë¹ï­œÑ­=Óİ=ëŞöï^_ï~øë^øï÷ßMœÛN½ïnõåş÷ïµïùï}õÙÍ´ëùë^œåş½ïnõåş÷ïµïùï}œÑ­=Óİ=ïN½éî»ïNŸéî»åş÷ïµïùï}œÛMºï÷ÛİÛÑ­=ÓŞ½ïnõåşŸïN÷ÙİŞïNöéş·ë÷ï~_ë^üëŞ_ëŞöï]¼ï®ºë_ë¹ï­œÑ­=Óİ=ëŞöï^_ï~øë^øï÷ßMœÛN½ïnõåş÷ïµïùï}õÙÍ´ëùë^œåş½ïnõåş÷ïµïùï}œÑ­=Óİ=ïN½éî»ïNŸéî»åş÷ïµïùï}œÛMºï÷ÛİÛÑ­Óİ=ëŞºÛM¼ï®ºë_ë¹ï­İî¸ïµéÎ_ï®ºë_ï~ıéî·åşéş¸ë½ÛNÛÑ­=Óİ=ëŞöï^_éşôï}İîôïnŸë~¹ï~÷åş·ë^ëŞºåş½ïnõÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=ëùë^œåş½ïnõåş÷ïµïùï}œÛN½ïnõåş÷ïµïùï}õÙÍ´Û®øï}½İ½Óİ=ÓİŸÙ­Óİ=Óİ´Ù­´ïNöéş·ë÷ï}´ï¼ë´ïn¹ë¾_ïôëµï¹ÛNºéşöÛNôëŞüÛNºïnŸéİ´ëùë^œåş½ïnõåş÷ïµïùï}Óİ=Óİ´Ù­´ë^ë´çn8ãİ´ïn¹ëùïN¸ë^øë´ë®öéşÛN½éî¸ëŞúëŞ¸ïµéÍ´ç®:ã÷Ñ­=Óİ=ÛMšÙıÓİ=ÓŞ½ïnõåşŸïN÷ÙİŞïNöéş·ë÷ï~_ïn¹ë¾_ïôëµï¹ÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=ÛÍ¼ëŞöï^_ï~øë^øï÷ßM´Û­´ßNüãôÛİ´íÍÓİ=Óİ=ëùë^œåş½ïnõåş÷ïµïùï}½ÙÍÓİ=Óİ=ëŞöï^_ï~øë^øï÷ß]œÛMºï÷ÛİÛÑ­=Óİ=ëŞöï^_éşôï}İîôïnŸë~¹ï~÷åş¹ïNŸë~¼åş½ïnõÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=ëùë^œåş½ïnõåş÷ïµïùï}œÛN½ïnõåş÷ïµïùï}õÙÍ´Û®øï}½İ½Óİ=íİ´ëœï~¹ÛNÛÑ­=Óİ=ëŞöï^_éşôï}İîôïnŸë~¹ï~÷åş·ë^ëŞºåş½ïnõÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=ëŞöï^_ï~øë^øï÷ßMœÛN½ïnõåş÷ïµïùï}õÙÍ´Û®øï}½İ½Óİ=ÓŞ½ïnõåşŸïN÷ÙİŞïNöéş·ë÷ï~_ïn¹ë¾_ïôëµï¹ÛÎúë®¹åş¸ëúÙÍÓİ=Óİ=ëŞöï^_ï~øë^øï÷ßMœÛN½ïnõåş÷ïµïùï}õÙÍ´Û®øï}½İ½Óİ=ÓŞ½ïnõåşŸïN÷ÙİŞïNöéş·ë÷ï~_ëôéş·ëÎ_ëŞöï]¼ï®ºë_ë¹ï­œÑ­=Óİ=ÓŞ½ïnõåş÷ïµïùï}ôÙÍ´ëŞöï^_ï~øë^øï÷ß]œÛMºï÷ÛİÛÑ­=ÓŞİÑ­=íİíİÑ®½éîøÛNï~åş½ï~ôåş÷ëøåş÷ïn·åş÷ïµï¹ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­œÛNúéş½ë´Ù®µïn»Ûİí½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë^üëŞ_ï~öë~_ï~øë^øë´Ù®÷ïn·åş÷ïµï¹ÛMİÛNµïn»İ½Ñ­=ëŞºÛM¼ï~öë~_ï~øë^øëİî½éîôïøåş÷ïn·ÛMŞİİ´ç®:ã_ç~vã~_áŞ5çÍ½Ñ­=ÓŞöëøïöéí´ÙŞ9ãŞç®5áÍÛÑ­=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ï~öë~_ëŞë®Ÿå¾÷ïn·åş÷ïµï¹ÙİŞëŞïNùï_ï~öë~]Ùîµë~øëŞúë´İİÓŞ÷ïn·åş÷ïµï¹ÙİŞï~öë~_ë^·ï½ï®¹İ½ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ï~öë~_ï~øë^øëİî½éîôïøåş÷ïn·åİë®öë^ë_ëŞ¸ÛMİÑ­=ï~öë~_ï~øë^øëİî÷ïn·åşºïnµéŞ¹åş½ëÛÑ­=ïn¹ïùïnÛMôİ½íİÑ®÷ïµï½ë}´ï®ŸëŞ¸ÛNï~åşúë®¹åş½éşéŞùåşºë^ùéÎøåş¼ë^ëœëöÛÎ÷ïöï·ï´ëŞŸéŞï_ëŸéŞµëŞÛMšëŸéŞµëŞÙÍÓŞ÷ïöï·ï´ë¹ï®½ë~¹ÛMšë¹ï­œÛNùéî÷ëŞ»éî¹ë´éÎŸéî»ÛN½éşúë]œÛN½éîøÛNºéÎµë¾÷ÙÍ´ï®ŸëŞ¸ÛMšïŸé¾¹éí½Ñ®ÛÑ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛMİÛNçáÍÛÑ­ÓŞ½ë­´ÛÎøéş›ëÛİ´í½Óİ=ï®ºë_ë¹ï­´İİ´ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšÛŞøéş›ëİ½Óİ=ï®ºë_ë¹ï­İîôë^»ë_ë®µïœï_ë^¸ëöÛMİÛN½éşúë]ÛÑ­=ÓŞ½ë­´ÛÍµï®ºë_ë¹ï­İî¶ïºåşë¾öÛNÜíÍ´Û^úë®¹åş¸ëúÙİŞënùë®_éŞ»ïmİîŸïN÷ÛNÜíÍÓİ=Óİµï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]éîùéŞ_ë^·ï½ï®¹åş÷ïöëµéİ½ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­¹ë´ënùë®_éŞ»ïm´Ûôá½´ë^·ï½ï®¹ÛN÷ïöéŞ÷ÛM¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍÓİ=Óİ=åş_áÎ=áî9åş_ÙÍ´ï®ºë_ë¹ï­İî¶ïºåşë¾öÙÍÓİ=Óİ=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]éîùéŞ_ë^·ï½ï®¹åş÷ïöëµéİ½İ½Óİ=ÓŞ»éşøéı´ëëÛÑ­=ÓŞİÑ­Óİ=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=ëŞºÛM¼ï®ºë_ë¹ï­İîúë®¹åşŸïN¹éî_ë~ï´İí´ßM½ÛNÛÑ­=Óİ=ïNöåş¹ïnöåşöë^øëœëŞëŞøë¸ÛÍ¶Û÷İ­´ë®µïœï´ë^¸ëöë÷ï}´ëŞ÷ÛM¹éÎüåÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛN½éşúë]½İ½Óİ=ÓŞï~åş½ï~ôåşôïnŸë~¹ï~÷åş½éşéŞùåşôë^»ë_ë®µïœï¼ï®ºë_ë¹ï­½İ½Óİ=íİ´ëœï~¹ÛNÛÑ­=Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´éîŸÛN¼ë^ëœëŞë½œÛNúë®¹ÛNŸïN¹éí´ë~ï´İİ´Û¸åÎÛmœÑ­=Óİ=ÓŞ_åşºïë~_åıœÛNúë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÛİÛÑ­=ÓŞİÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=íİ´ëœï~¹ÛNÛÑ­=ÓŞ=ç~tåş8ãn;ÛÍ¶Û÷İ­¹ë]ÛNéı´ïŸé¾¹éí´ïn¹ë~¹ëŞúë¸İ­´Ûôá¾\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åıœÛN_åşãŞã_åıœÛNøéş›ëÛİÛÑ­=ÓŞ»éşøéı´ëëÛÑ­=íİëëÚÑ­=ïn¹ïùïnİ½íİÑ®½éîøÛNï~åş½ï~ôåşŸïN¹éî_éîŸë¹ÛÎ÷ïöï·ï´ï­øéÍöåş÷ï¶ë¹ï­´Ù®÷ëœÛN÷ïöï·ï´ï­øéÍöåş÷ï¶ë¹ï®_ë®¼ÛMšë®¼Ûİí½ÓŞ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­´İİ´ï­øéÍöåş»ëøåş÷ï¶ë¹ï®¸ë^øë]¼ï~¸ÛİÛÑ­=éÎŸéî»ÛNöë}´İİ´ßMÛÑ­ÓŞ=ç~tåş8ãn;ÛÍ¶Û÷ÛNŸïN¹éî_ë~ï´ÛùåÎÛmœÛN_åşºïë~_åıœÛNúë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÛİÛÑ­ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]´İİİÛNçáÍ´íÎÜÑ­=ÓŞúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İî¸ïµéÎ_ï®ºë_ïn¹ï}´İİİÛNçáÍ½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN9ïnöéşöÛN½éí´ïNöéş¶ëÛNéı´ë~ŸéŞéşåş¸ë^øë]´éşöÛN¸ïµéÍ´ï®ºë´ïn¹ï~\éí¶ÙÍÓİ=ÓŞ_åşºïë~_åı½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Ñ­=ëŞºÛM¼ï®ºë_ë¹ï­İîúë®¹åşŸïN¹éî_ë~ï›Ù½½ÛNÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞöëøïöéí´ßMÛÑ­=íİÑ­=ï®ºë_ë¹ï­İîöë÷ëøåşôëë½éî»ÛMİÛMôİ½ÓŞúë®¹åş¸ëúÙİŞëŞ÷ïN_ï~Ÿë®_ë¹ënùë½´İİ´ßMÛÑ­=ï®ºë_ë¹ï­İî½ï~ôåşöë^ûßN_ë¹ënùë½´İİ´ßMÛÑ­=ï®ºë_ë¹ï­İî½ï~ôåşöë^ûß^_ë¹ënùë½´İİ´ßMÛÑ­=ï®ºë_ë¹ï­İî½ï~ôåşöë^ûßn_ë¹ënùë½´İİ´ßMÛÑ­=ï®ºë_ë¹ï­İî½ïnõåş÷éşºåş½ë´İİ´ßMÛÑ­=ëŞºÛM¼ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùî½éî½ï_ëÎûÛÎúë®¹åş¸ëúÛİ´İÍ´ßM½ÛNÛÑ­=ÓŞôïn_ëöïm¼Ûm¹ï}ÚÛN½éî½ï´ëÎµïn¸ï¾µïn¹ÛNºë^½éÎ¹ë\éí¶ÙÍ´åş_ë®ùéî·åş_ÛİÛÑ­=ÓŞúë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÙİİ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İîöëµéÎøëŞë_éŞùï¹ïÍ½İ½Óİ=ïn¹ïùïnÛMã6çwçİÛÑ­=íİÑ­=éŞ¹éŞ÷ëøÛÍºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıœÛMôÙÍ´ï~½í®¹éşºÛÎúë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÛİ½İ½ÓŞµïŸéŞ½ë~_ï~¹ï¼Û®úë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÙîŸï®¹ïnºéÎŸï¾_ï~øë^øëœÛNáş_áşzãvã®áş{ÛİÛÑ­ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ë~œëµïn_ï~øë^øï÷åşöë»ÛÎúë®¹åş¸ëúÛİÛÑ­ÓŞúë®¹åş¸ëúÙİŞï®ºë_ëÎûåşúëöï~½éşÛMİÛNï~åş·ë^ëöë^_ëŞŸåşöÛÎúë®¹åş¸ëúÙİŞï®ºë_ënµï~¹ÛİÛÑ­=ãŞwçN_ã6ã½¼Ûm¹ï}ÚÛN<ç½´ç®¹ïn÷ëŞŸéíÚÛMôïÍ¹ïÎ\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­İîúë®¹åş¼ï¾_ï®¹ïn÷ëŞŸéí½İ½ÓŞöë}´İİ´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë~Ÿïn¹åşŸïN÷Ùîöë÷ëøåş¼ï½¼ï®ºë_ë¹ï­œÛMõÙÍ´ß]½İ½ÓŞ½ë­´ÛÎöë}´İÍİÛMôÛİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ïn¹ï~¹ï´ï½éŞ¹éşùï\éí¶ÙÍ´åş_ë®ùéî·åş_ÛİÛÑ­=ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ïn¹éÎ¹ë^÷ë_ëÎûÛÎúë®¹åş¸ëúÛİÛÑ­=ÓŞúë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÙİİ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İîöëµéÎøëŞë_éŞùï¹ïÍ½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ëŞëŞøåş¼ï¾_ïn¹ë½¼ï®ºë_ë¹ï­½İ½Ñ­=ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéşôï}İî¶ïºåşë¾öåş½éî½ï¼ï®ºë_ë¹ï­İî¶ïºåşë¾öÙÍÓİ=Ûnï~åş½ï~ôÛm½İ½Ñ­=éŞ¹éŞ÷ëøÛÍºï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]œÛMôÙÍ´ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ë^üëŞ_ï~¼ë^öë¸åş¸ë^øë]½ÛİÛÑ­=éŞ¹éŞ÷ëøÛÍºï®ºë_ë¹ï­İî÷ïµï÷åş¸ë^øë]œÛMôÙÍÓİ=ï~½í®¹éşºÛÎ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ï~øë^øï~_ï~¼ë^öë¸åş¸ë^øë]½ÛİÛÑ­=éŞ¹éŞ÷ëøÛÍºï®ºë_ë¹ï­İî¹ïnöéşöåş½éîºéıœÛMôÙÍ´ï~½í®¹éşºÛÎúë®¹åş¸ëúÙİŞëöïnŸïn_ëŞë®ŸÛİ½İ½ÓŞëï~¹ï¼Û®úë®¹åş¸ëúÙİŞë®¹ï·ëÎ_ëë¾½éî¹åş½éîºéıœÛMôÙÍÓİ=ï~½í®¹éşºÛÎúë®¹åş¸ëúÙİŞë®¹ï·ëÎ_ëë¾½éî¹åş½éîºéı½ÛİÛÑ­=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ëÎûåş½éîºéı´İİ´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞë^üëŞ_ëÎûåş½éîºéıÛÑ­=ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ëë^¶éÎ¹åşºïnµéŞ¹ëŞ¸åşöë·éşúëöïİ´İİ´ßMÛÑ­=ï®ºë_ë¹ï­İîúï_ëë^¶éÎ¹ÛMİÛMôİ½ÓŞúë®¹åş¸ëúÙİŞïn¹ë¾_ïôëµï¹åşöëõï¹ï~øë¸ÛMİÛMôİ½ÓİŸÙ­´çn¹ë¾½ï~øëöÛNôë^»ë´ë®µïœï´ëÎµéî¸éÎ¹ïm´Ù­ŸÑ­=ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞïNµë¾¹ë®µïœï_ë¹ënùë¾_ë½ï~µënœë´İİ´ßMÛÑ­=ÙıšÛN½éî½ï½ë^œëŞÚë´ïN¸åş¶ïºåş½ëüÛNûëŞøëÍ´ë^ÛN½éîúë^œëŞ¸ÛN½éî¸ëüÛMôïÎ:ÛMšÙıÓŞúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîôë_ënùë®_ëŞ¸ïÍ´İİ´ßNüã­ÛÑ­ÓŞ·ë^åş÷éŞï_ïn¹ë¾_ë~œëŞ¹éîøåşôë^»ë_ë®µïœï_ëÎµéî¸éÎ¹ïm¼Ñ­=Óİ=ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞëŞŸéŞï_ëÎ¸éÍœÑ­=Óİ=éŞ÷éŞ_ï®ºë_ëŞŸéŞï_ë®µïœï_ëÎµéî¸éÎ¹ïmœÑ­=Óİ=áîyáÎÙÍÓİ=ÓŞúë®¹åş¸ëúÛİÛÑ­=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ïn¹ïùïnÛMôİ½íİÑ­·ëŞºë¹ë­´ã~áî:ãŞ;åşç~åş5ç®xãŞãvÑ®÷ïµï½ë}´ï®ŸëŞ¸ÛNï~åş½ï~ôåş¹éî¸åşµï®øëŞëöÛÎúéş½ë½Ñ®ÛÑ­=éŞ÷éŞ_ëŞ÷ïN_ï~øéşôåşµï®øëŞëöÛÍ½İ½íİÛ~¹éÎ÷ëï~øë^øëŞ·ÛNúéş½ë´éŞ÷éŞ_ëŞ÷ïN_ëë_ë^úï½éŞ¹ïm¼ï®ŸëŞ¸Ûİí½ÓŞôïn_ëöïm¼Ûn5ç­´ç½éŞ¹ïm´ëŞ÷ÛNéşøÛN÷ïôïNŸïnøë¸åÎÛm½İ½íİÛ~¹éî¸ëŞºÑ­ëŞï´éŞ÷éŞ_ëŞ÷ïN_ë~œéş÷ë_éîŸë¹ÛÎ÷ïöï·ï´ï­øéÍöåş÷ï¶ë¹ï­´Ù®÷ëœÛN÷ïöï·ï´ï­øéÍöåş÷ï¶ë¹ï®_ë®¼ÛMšë®¼Ûİí½ÓŞœéşë½´ïn·ÛMİÛMôİ½ÓŞ½éîøÛNûéİÛÑ­=ëŞï´ëİÛÑ­=ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛMİÛNúßœßn_ë¾¹ï_ï~ùën¸ëúëµïµÛÎ÷ë½İ½Ñ­=ãŞwçN_ã6ã½¼Ûm¹ï}´ã´éşôëåş·éîøÛM¹ï\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´ï®ºë_ë¹ï­İîúë®¹åşŸïN¹éî_ë~ï½İ½ÓŞïøëüåşœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=éŞùï¹ïÎ_éÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Ñ­=ëŞºÛM¼Û^úë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÛİ´í½Óİ=ïNöåş¹ïnöÛÍ¶Û÷ÛN½éîúë^œëŞ¸ÛN÷ïµï¹ÛNŸïN¹éí´ë~ï´Û¸åÎÛmœÛN_åşºïë~_åıœÑ­=Óİ=ï®ºë_ë¹ï­İîúë®¹åşŸïN¹éî_ë~ï½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İî·éşöë_éŞùï¹ïÍ½İ½Óİ=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İîöëµéÎøëŞë_éŞùï¹ïÍ½İ½Óİ=ïn¹ïùïnÛMã=áîzã^İ½ÓŞİÑ­ÓŞ½ë­´ÛÎúë®¹åş¸ëúÙİŞï®ºë_éşôëåş·éîøÛMŞÛMõÛİ´í½Óİ=ï®ºë_ë¹ï­İîúë®¹åşŸïN¹éî_ë~ïÙİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞïn¹ë^œï½éŞ¹åşïøëüÛİÛÑ­=ÓŞöëøïöéí´ßMÛÑ­=íİÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_áÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=éŞ÷éŞ_ëŞ÷ïN_ïn¹éÎ¹ë^÷ë_ë^œéÎ_ë^üëŞ_ï~øïn¹ë^ÛÎúë®¹åş¸ëúÛİÛÑ­=éŞ÷éŞ_ëŞ÷ïN_ïn¹éÎ¹ë^÷ë_ë^œéÎ_ï~øë^øï~_ï~øïn¹ë^ÛÎúë®¹åş¸ëúÛİÛÑ­ÓİŸÙ­´çïn¹ë¾½ï~øëöÛNôë^»ë´ë®µïœï´ëÎµéî¸éÎ¹ïm´Ù­ŸÑ­=ë~µéŞ_ï~éŞùåşöë»åş·éÎ½ëï_ïNµë¾¹åşºë^ùéÎøåş¼ë^ëœëöÛÍÓİ=ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞëŞŸéŞï_ëÎ¸éÍœÑ­=ÓŞçáÍœÛNçáÍœÛNúë®¹åş¸ëúÛİÛÑ­ÓŞöë}´İİ´ï®ºë_ë¹ï­İî¼ï¾_ëŞë®ŸÙİŞï®ºë_éşôï}ë^üëŞ_éşôï}ëÎµéÎøÛÎúë®¹åş¸ëúÙÍ´ß]½İ½ÓŞ½ë­´ÛÎöë}´İÍİÛMôÛİÓİ=ïNöåş¹ïnöÛÍ¶Û÷İ­´ëÎµéÎøÛNøëŞëŸïøÛNöë}İÛœë\éí¶ÙÍ´åş_ë®ùéî·åş_ÙÍ´ïn·ÛİÛÑ­ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ïôëµï¹åş·ë^ëŞºåş÷ïµï¹ÛÎúë®¹åş¸ëúÙÍÓİ=ã=ç~5ãnã_ã~5áŞ=ã®_ãŞáŞ9ã=ã^xãçİ½İ½ÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ïn¹ï~¹ï_ëÎûÛÎúë®¹åş¸ëúÙÍ´ßMœÛMôÛİÛÑ­ÓİŸÙ­´ïNùï´ï~·ïnµï·ëÍ´ënùë­´ëŞÛNµéÎœÛNøëÎ¹ÛNûéİ´Ù­ŸÑ­=ë®Ÿïm´ÛÎûéİ´İİ´ßMÛÛNûéİ´İÍ´ï®ºë_ë¹ï­İîµïÎ½åş¸ë^øë]ëÎûåş½éîºéıİîïåşûéİÛÛNûéİ›Ù½½ÛNÛÑ­=ÓŞï~åş½ï~ôåş·ë®»åşûéŞ_ï~·ïnµï·ëÍ¼ï®ºë_ë¹ï­œÛNûéİœÛNzã®9åştãŞã¾_ã®ã^;ÛİÛÑ­=ÓŞï~åş½ï~ôåş·ë®»åşûéŞ_ï~·ïnµï·ëÍ¼ï®ºë_ë¹ï­œÛNûéİœÛNzã®9åştáşã¾_ã®ã^;ÛİÛÑ­=íİÓŞúë®¹åş¸ëúÙİŞëÎûåş½éîºéıİîúë®¹åşŸïN÷Ùî·éşöë_éşôï}ïn¹éÎ¹ë^÷ë_ëÎûÛÎúë®¹åş¸ëúÛİÛÑ­=ÙıšÛNµë®øëöÛNöë»ïœë^öÛN¼ï½´ï~øéşôÙÍ´ïn¹ëùë~¹ÛNŸïN¹éí´ë~ï´Ù­ŸÑ­=ï®ºë_ë¹ï­İîúë®¹åşŸïN¹éî_ë~ïÙİÛÑ­=ï®ºë_ë¹ï­İî¶ïºåşë¾öÙİŞéşôï}İî¶ïºåşë¾öåş¸ë½éî½ï¼ï®ºë_ë¹ï­İî¶ïºåşë¾öÛİÛÑ­=ëŞºÛM¼ï®ºë_ë¹ï­İîúï_ëë^¶éÎ¹Ûİ´í½Óİ=éŞ÷éŞ_ëŞ÷ïN_ëë_ë^úï½éŞ¹ïm¼ÛİÛÑ­=ÓŞúë®¹åş¸ëúÙİŞï®øåş¹éîµënœë´İİ´ßMÛÑ­=íİÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛNzã®9åşwçn7åşã^|İ½´ëİ›Ù½½Ñ­=ÓŞúë®¹åş¸ëúÙİŞë^üëŞ_ëµïµÙî÷ïn·åş½éîºéş[ëŞ]ÙîœïNÛMİÛMôİ½ÓŞç~åş=ç~tåş8ç5áÎ_ç®:ã_áŞyç9çÎ_çáÎã~ÛÎúë®¹åş¸ëúÛİÛÑ­=ï®ºë_ë¹ï­İî½ï~_ï~ôéÎ½ï´İİ´ßMÛÑ­=ï®ºë_ë¹ï­İî¸ïµéÎ_ï®ºë_ï~ıéî·åşéş¸ë´İİ´ßMÛÑ­ÓŞïøëüåşùéîœéş·é½¼Û®úë®¹åş¸ëúÙİŞë~Ÿïn¹åşïøëüÛİÛÑ­=éŞùï¹ïÎ_ïéÎŸë~›ÛÍºï®ºë_ë¹ï­İîöëµéÎøëŞë_éŞùï¹ïÍ½İ½ÓŞöëøïöéí´ßMÛÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåşºéÎùï~¼åşøë^÷é¾œëøÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­½Ñ®ÛÑ­=ïï~½ë¾ë¸ÛNœéşë½´ë®œë^»ï}ÛÑ­=ëŞï´ëİÛÑ­=ï~øïnùë~øÛNï~åşúë®¹åşøë^÷é¾œëøåşõï¹ï¹åş·éŞ¸ÛMšï^ùëùë_ë~ëœÛMšï^_ë~ë_éî¹ïÎøİ½ÓŞ÷ïöï·ï´éŞ÷éŞ_ï®ºë_ïµï~›éÎ¹ï´Ù®øë^÷é¾œëøİ½Ñ­=ë®Ÿïm´ÛÎ½ÛMİÛMôİ½´ëİ´İÍİÛNã^|åşzã®9İ½´ëİ›Ù½½ÛNÛÑ­=ÓŞ½ë­´ÛÎ½ÛMµİİ´ï®ºë_ë¹ï­İîôë¹ï­İî½ë´Û­ºÑ­=Óİ=ëİ´Û]İÛNã^|åşzã®9ÛİÓİ=ÓŞ·éşï½éîùëÛÑ­=ÓŞøë^÷é¾œëøÛMİÛMºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞïµï~›éÎ¹ï÷å¾½åİÛÑ­=ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøåşœéş·é½œÛNºéÎµë¾÷ÛİÛÑ­=ÓŞœëŞ÷ï_ë®Ÿïn_ëµë~¼åş¹éîøïnıåş÷ë^ºë¼ï^ùëùë_ë~ëœÛNõåş·éŞ¸åşëüïœÑ­=Óİ=Û®øë^÷é¾œëøÙİŞïµï~›éÎ¹ï_ï]œÛNœëŞ÷ï½ÛNÛÑ­=Óİ=ëŞºÛM¼ï^ùëùë_ë~ëİîúë®¹åş¸ëúÛMµİİ´ï®ºë_ë¹ï­½Ñ­=Óİ=ÓŞ·éşï½éîùëÛÑ­=Óİ=éÎ½ï~øåş¸ëœåş½éî½ï¼Û®õï¹ï¹åş·éŞ¸ÙİŞéÎ½ï~øÛİÛÑ­=Óİ=ï^ùëùë_ë~ëİî·éŞ¸åşùï~¹ë´İİ´ßMÛÑ­=ÓŞİÑ­=ÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Û®øë^÷é¾œëøÙİŞïµï~›éÎ¹ï_éÎŸë~›ÙÍ´ë®œë^»ï}½İ½Óİ=ïµï~›éÎ¹ï_é¾½éÎœÛÍºïµï~›éÎ¹ïİîøë^÷é¾œëøÛİÛÑ­=íİÓŞµïŸéŞ½ë~_ï~¹ï¼Û®úë®¹åş¸ëúÙİŞëŞöï^_ë~ïœÛMôÛİÛÑ­íİÑ®úéş½ë´éŞ÷éŞ_ëŞ÷ïN_ëŞöï^_ë¹ënùë¾_ëùéŞôÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­½Ñ®ÛÑ­ÓŞùëŞïüåşøÛN½ÙÍ´ëùéŞôåş½éî¸ëüİ½ÓŞùéî÷ëŞ»éî¹ë´éÎŸéî»ÛNºéÎµë¾÷İ½Ñ­=ï~ôëŞåşœéş·é¾_ëŞöï^÷ë^úë¼Ñ­=Óİºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÙî·éşéŞŸéî_ë¹ï®_ëŞöï^_ëùéŞôåşœéş·é½œÑ­=ÓŞºéÎµë¾÷ÛİÛÑ­=ëùéŞôåş½éî¸ëüÛMİÛNúë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMë~ùïnöëï_ëŞöï^_ëŞë¹ïÍÛÑ­=ë®Ÿïm´ÛÎ½ÛMİÛMôİ½´ëİ´İÍ´áŞ5çÎ_ç®:ã_ãŞvç^_ã9ãnyã¾_ãyáŞtåşwãŞZãÛÛN½Ù½›Ûİ´í½Óİ=ëùéŞôåş½éî¸ëüÙ½›İ½ÓŞİÑ­=ï~ôëŞåşùéîœéş·é¾_ëŞöï^öë÷ïŸïn¹ÛÍÓİ=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMë~ŸéŞéşåş¸ëúåş½ïnõåş¸ïïN_éÎŸë~›ÙÍÓİ=ë®œë^»ï}½İ½íİÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåşøë^÷é¾œëøåş¸ë¶ï»åş¸ïïM¼ï~øïnùë~øÛNúë®¹åş¸ëúëŞ·ë´Ù®úë®¹åş¸ëúÛİí½Ñ­=ï½éîøßÎ_ï´ëİœÛN¸ïïN_ëŞë¹ïÍÛÑ­=ïï~½ë¾ë¸ÛNœéşë½´ë®œë^»ï}ÛÑ­ÓŞ÷ïN½éî_éÎŸë~›åş½ïnõï~µï®¹ÛÍÓİºï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÙî·éşéŞŸéî_ë¹ï®_ïµï~›éÎ¹ï_ëùéŞôåşœéş·é½œÑ­=ë®œë^»ï}½İ½ÓŞ¸ïïN_ëŞë¹ïÍ´İİ´ï®ºë_ë¹ï­İî·éşéŞŸéî_ëµïµÙİŞï®ºë_ëŞöï^_ëùéŞôÙî·ïöïn¹éîøåşøë^÷é¾œëøåş½éî¸ëüİ½ÓŞºéşöÛM¼ëİ´İİ´ßMÛÛN½ÛMÜÛNã^|åşzã®9åş=çnuåş8ã6ç;åş8ççN_ç~=å®9İ½´ëİ›Ù½½ÛNÛÑ­=ÓŞ¸ïïN_ëŞë¹ïÍ›Ù½ÛÑ­=íİÓŞ÷ïN½éî_ïéÎŸë~›åş½ïnõïn¹ï~øéşöë¼Ñ­=Û®úë®¹åş¸ëúÙİŞë~ŸéŞéşåş¸ë^øë]İîúë®¹åş½ïnõåş¸ïïMë~ŸéŞéşåş¸ëúåşøë^÷é¾œëøåş¸ïïN_éÎŸë~›ÙÍÓŞºéÎµë¾÷ÛİÛÑ®İÑ­ï®ŸëŞ¸ÛNï~åş½ï~ôåş¸ïïN_ïN½éî»åşôéşë¾_éŞ½ï~ë^øë~¼ÛÎ÷ïöï·ï´ï®ºë_ë¹ï®½ë~¹ÛMšï®ºë_ë¹ï­½Ñ®ÛÑ­ÓŞï~åş½ï~ôåş½ïnõåş¸ë¶ï»åş¸ïïM¼ï®ºë_ë¹ï­½İ½ÓŞï~åş½ï~ôåşøë^÷é¾œëøåş¸ë¶ï»åş¸ïïM¼ï®ºë_ë¹ï­½İ½íİ
