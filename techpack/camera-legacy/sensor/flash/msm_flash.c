@@ -17,6 +17,7 @@
 #include <linux/of_gpio.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
+#include <linux/fs.h>
 #include "msm_flash.h"
 #include "msm_camera_dt_util.h"
 #include "msm_cci.h"
@@ -126,6 +127,35 @@ static struct led_classdev msm_torch_led[MAX_LED_TRIGGERS] = {
  */
 static int qcom_flash_torch_state;
 
+/*
+ * 本文件与 drivers/media/platform/msm/camera_v2/sensor/flash/msm_flash.c
+ * 是两份同名驱动，实际绑定 qcom,camera-flash 的可能是另一份，那样本文件的
+ * 静态 torch_trigger 永远是 NULL（实测：torch-light0 的 trigger 是 [none]，
+ * 而 led:torch_0 上是 [torch0_trigger]）。所以 trigger 不可用时直接写
+ * qpnp flash LED 的 sysfs，保证手电筒真的能被点亮/熄灭。
+ */
+static void qcom_flash_led_set(int on)
+{
+	struct file *f;
+	const char *val = on ? "255" : "0";
+	int len = on ? 3 : 1;
+
+	if (torch_trigger) {
+		led_trigger_event(torch_trigger, on ? LED_FULL : LED_OFF);
+		return;
+	}
+
+	f = filp_open("/sys/class/leds/led:torch_0/brightness", O_WRONLY, 0);
+	if (IS_ERR(f)) {
+		pr_err("%s: cannot open torch led node (%ld)\n", __func__,
+		       PTR_ERR(f));
+		return;
+	}
+	kernel_write(f, val, len, &f->f_pos);
+	filp_close(f, NULL);
+	pr_info("%s: torch %s via sysfs\n", __func__, on ? "on" : "off");
+}
+
 static ssize_t qcom_flash_proc_read(struct file *file, char __user *buff,
 				    size_t count, loff_t *ppos)
 {
@@ -177,14 +207,8 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 
 	qcom_flash_torch_state = val ? 1 : 0;
 
-	if (!torch_trigger) {
-		pr_err("%s: no torch trigger available, LED left untouched\n",
-		       __func__);
-		return orig;
-	}
-
 	/* 非 0 一律给最亮，避免 HAL 传 1 时电流档为 0 反而看不到灯 */
-	led_trigger_event(torch_trigger, val ? LED_FULL : LED_OFF);
+	qcom_flash_led_set(val ? 1 : 0);
 
 	return orig;
 }
