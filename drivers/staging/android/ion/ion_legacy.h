@@ -104,6 +104,27 @@ struct ion_handle_data {
  */
 #define ION_IOC_SYNC		_IOWR(ION_IOC_MAGIC, 7, struct ion_fd_data)
 
+/**
+ * struct ion_fd_data_legacy - 4.9 qualcomm ion_fd_data
+ * @handle:	a handle
+ * @fd:		a file descriptor representing that handle
+ * @offset:	unused by the vendor sync path, part of the struct ABI
+ * @flags:	unused by the vendor sync path, part of the struct ABI
+ *
+ * The 4.9-era vendor gralloc/memalloc builds ION_IOC_SYNC over this
+ * 16-byte struct, so its command encodes as _IOWR(ION_IOC_MAGIC, 6,
+ * 16) instead of the 8-byte nr 7 form.
+ */
+struct ion_fd_data_legacy {
+	ion_user_handle_t handle;
+	int fd;
+	unsigned int offset;
+	unsigned int flags;
+};
+
+#define ION_IOC_SYNC_LEGACY	_IOWR(ION_IOC_MAGIC, 6, \
+				      struct ion_fd_data_legacy)
+
 #endif /* CONFIG_ION_LEGACY */
 
 #endif /* _ION_LEGACY_H */
