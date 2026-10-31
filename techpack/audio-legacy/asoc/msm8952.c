@@ -3597,6 +3597,32 @@ static const struct of_device_id msm8952_asoc_machine_of_match[]  = {
 	{},
 };
 
+/*
+ * A57 speaker workaround: the vendor mixer_paths speaker path only
+ * flips HPHL, so the internal Class-D speaker output never gets
+ * enabled. Turn the SPK DAPM mux on once after the card is up; the
+ * speaker PA then follows the normal DAPM playback power-up and
+ * shuts down with it. Pure kernel-side, no vendor file change.
+ */
+static void msm8952_force_spk_mux_on(struct snd_soc_card *card)
+{
+	struct snd_kcontrol *kctl;
+	struct snd_ctl_elem_value ucontrol;
+
+	kctl = snd_soc_card_get_kcontrol(card, "SPK");
+	if (!kctl) {
+		pr_err("%s: SPK kcontrol not found\n", __func__);
+		return;
+	}
+	memset(&ucontrol, 0, sizeof(ucontrol));
+	ucontrol.value.enumerated.item[0] = 1;
+	ucontrol.value.enumerated.item[1] = 1;
+	if (kctl->put(kctl, &ucontrol) < 0)
+		pr_err("%s: SPK put failed\n", __func__);
+	else
+		pr_info("%s: speaker mux set to Switch\n", __func__);
+}
+
 static int msm8952_asoc_machine_probe(struct platform_device *pdev)
 {
 	struct snd_soc_card *card;
@@ -3949,6 +3975,8 @@ parse_mclk_freq:
 			ret);
 		goto err;
 	}
+
+	msm8952_force_spk_mux_on(card);
 
 	return 0;
 err:
