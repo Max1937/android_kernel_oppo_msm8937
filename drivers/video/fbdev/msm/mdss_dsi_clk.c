@@ -186,36 +186,34 @@ static int dsi_link_hs_clk_set_rate(
 		/*
 		 * The direct path (4x VCO) is impossible below the 350MHz PLL
 		 * floor, so panels with a ~64MHz byte clock must go through the
-		 * /2 indirect path with the VCO at exactly 8x. Reprogram the PLL
-		 * and rewire the mux, then retry the divider request.
+		 * /2 indirect path with the VCO at exactly 8x. The gcc RCG2 in
+		 * between has no usable freq_tbl entry for this rate, so
+		 * clk_set_rate can never succeed in software; what matters is
+		 * that the PLL hardware is programmed to exactly 8x. Run the
+		 * indirect programming, refresh the cached VCO rate and decide
+		 * on hardware correctness instead of retrying set_rate.
 		 */
-		rc = mdss_dsi_pll_lpm_force_indirect0(
-			(unsigned long)link_hs_clks->byte_clk_rate);
-		if (rc) {
-			pr_err("indirect path recovery failed rc = %d\n", rc);
-		} else {
-			rc = clk_set_rate(link_hs_clks->byte_clk,
-				link_hs_clks->byte_clk_rate);
+		if (vco_rate != 8UL * (unsigned long)
+				link_hs_clks->byte_clk_rate) {
+			rc = mdss_dsi_pll_lpm_force_indirect0(
+				(unsigned long)link_hs_clks->byte_clk_rate);
 			if (rc)
-				pr_err("byte_clk retry after indirect path rc = %d\n",
+				pr_err("indirect path recovery failed rc = %d\n",
 					rc);
 			else
-				pr_err("byte_clk recovered via indirect path\n");
+				vco_rate = mdss_dsi_pll_lpm_get_vco_rate0();
 		}
-		if (rc) {
-			if (clk_get_rate(link_hs_clks->byte_clk) ==
-					link_hs_clks->byte_clk_rate ||
-			    vco_rate ==
-				8UL * (unsigned long)
-					link_hs_clks->byte_clk_rate) {
-				pr_err("byte_clk hw ok (vco=%lu 8x req), ignoring rc=%d\n",
-					vco_rate, rc);
-				rc = 0;
-			} else {
-				pr_err("clk_set_rate for byte_clk unrecovered rc = %d\n",
-					rc);
-				goto error;
-			}
+		if (clk_get_rate(link_hs_clks->byte_clk) ==
+				link_hs_clks->byte_clk_rate ||
+		    vco_rate ==
+			8UL * (unsigned long)link_hs_clks->byte_clk_rate) {
+			pr_err("byte_clk hw ok (vco=%lu 8x req), ignoring rc=%d\n",
+				vco_rate, rc);
+			rc = 0;
+		} else {
+			pr_err("clk_set_rate for byte_clk unrecovered rc = %d\n",
+				rc);
+			goto error;
 		}
 	}
 
