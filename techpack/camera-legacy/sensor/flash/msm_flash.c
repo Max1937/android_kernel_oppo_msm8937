@@ -1516,11 +1516,19 @@ extern bool camera_legacy_enable;
 static int __init msm_flash_init_module(void)
 {
 	int32_t rc = 0;
+
+	/*
+	 * /proc/qcom_flash 必须在 camera_legacy_enable 判定之前注册：
+	 * 该标志在模块 init 阶段还是 false，放在后面会让节点永远不出现，
+	 * 而 vendor HAL 只关心这个节点存不存在（缺了就连手电筒都不给用，
+	 * 卡住的灯也没法被强制关掉）。
+	 */
+	if (qcom_flash_proc_init())
+		pr_err("%s: /proc/qcom_flash init failed\n", __func__);
+
 	if (!camera_legacy_enable)
 		return -ENODEV;
 	CDBG("Enter\n");
-	if (qcom_flash_proc_init())
-		pr_err("%s: /proc/qcom_flash init failed\n", __func__);
 #if IS_ENABLED(CONFIG_MACH_XIAOMI_VINCE)
 	if (xiaomi_msm8953_mach_get() == XIAOMI_MSM8953_MACH_VINCE) {
         flashlight_ctrl = NULL;
