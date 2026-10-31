@@ -1344,17 +1344,6 @@ static int oppo_pa_apply(int idx, int enable)
 	return 0;
 }
 
-/*
- * 供 codec 调用。4.9 里外置功放是挂在 codec 的 SPK PA 事件上的，这样任何
- * 播放路径（铃声 / 充电提示音 / 通话）都会按 boost -> 1ms -> PA 的顺序打开
- * 功放，而不依赖 HAL 有没有写 Ext_SPK_Switch 这个 mixer 控件。
- */
-void oppo_spk_pa_enable(int enable)
-{
-	oppo_pa_apply(0, enable);
-}
-EXPORT_SYMBOL_GPL(oppo_spk_pa_enable);
-
 static int oppo_spk_switch_get(struct snd_kcontrol *kcontrol,
 			       struct snd_ctl_elem_value *ucontrol)
 {
