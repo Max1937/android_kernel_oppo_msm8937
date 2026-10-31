@@ -3604,6 +3604,35 @@ static const struct of_device_id msm8952_asoc_machine_of_match[]  = {
  * speaker PA then follows the normal DAPM playback power-up and
  * shuts down with it. Pure kernel-side, no vendor file change.
  */
+static int (*msm8952_orig_spk_put)(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol);
+static int (*msm8952_orig_rx3_put)(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol);
+
+/*
+ * The vendor speaker mixer path only selects RX1 MIX1 INP1 (RX1), which
+ * feeds PDM_OUT_RX1 and therefore only the headphone output. The speaker
+ * DAC on this codec is fed from PDM_IN_RX3, which needs RX3 MIX1 INP1
+ * pointing at I2S RX1. The vendor default block also resets both the SPK
+ * mux and RX3 MIX1 INP1 to ZERO during HAL init, so force the two
+ * controls and keep them forced even if userspace writes ZERO.
+ */
+static int msm8952_spk_put_force_on(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.enumerated.item[0] = 1;
+	ucontrol->value.enumerated.item[1] = 1;
+	return msm8952_orig_spk_put(kcontrol, ucontrol);
+}
+
+static int msm8952_rx3_put_force_rx1(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	/* enum: ZERO, IIR1, IIR2, RX1, RX2, RX3 */
+	ucontrol->value.enumerated.item[0] = 3;
+	return msm8952_orig_rx3_put(kcontrol, ucontrol);
+}
+
 static void msm8952_force_spk_mux_on(struct snd_soc_card *card)
 {
 	struct snd_kcontrol *kctl;
@@ -3612,15 +3641,31 @@ static void msm8952_force_spk_mux_on(struct snd_soc_card *card)
 	kctl = snd_soc_card_get_kcontrol(card, "SPK");
 	if (!kctl) {
 		pr_err("%s: SPK kcontrol not found\n", __func__);
-		return;
+	} else {
+		memset(&ucontrol, 0, sizeof(ucontrol));
+		ucontrol.value.enumerated.item[0] = 1;
+		ucontrol.value.enumerated.item[1] = 1;
+		if (kctl->put(kctl, &ucontrol) < 0)
+			pr_err("%s: SPK put failed\n", __func__);
+		else
+			pr_info("%s: speaker mux set to Switch\n", __func__);
+		msm8952_orig_spk_put = kctl->put;
+		kctl->put = msm8952_spk_put_force_on;
 	}
-	memset(&ucontrol, 0, sizeof(ucontrol));
-	ucontrol.value.enumerated.item[0] = 1;
-	ucontrol.value.enumerated.item[1] = 1;
-	if (kctl->put(kctl, &ucontrol) < 0)
-		pr_err("%s: SPK put failed\n", __func__);
-	else
-		pr_info("%s: speaker mux set to Switch\n", __func__);
+
+	kctl = snd_soc_card_get_kcontrol(card, "RX3 MIX1 INP1");
+	if (!kctl) {
+		pr_err("%s: RX3 MIX1 INP1 kcontrol not found\n", __func__);
+	} else {
+		memset(&ucontrol, 0, sizeof(ucontrol));
+		ucontrol.value.enumerated.item[0] = 3;
+		if (kctl->put(kctl, &ucontrol) < 0)
+			pr_err("%s: RX3 MIX1 INP1 put failed\n", __func__);
+		else
+			pr_info("%s: RX3 MIX1 INP1 set to RX1\n", __func__);
+		msm8952_orig_rx3_put = kctl->put;
+		kctl->put = msm8952_rx3_put_force_rx1;
+	}
 }
 
 static int msm8952_asoc_machine_probe(struct platform_device *pdev)
