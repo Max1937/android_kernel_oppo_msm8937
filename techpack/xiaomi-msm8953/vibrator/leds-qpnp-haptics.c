@@ -2204,6 +2204,15 @@ static int qpnp_haptics_parse_dt(struct hap_chip *chip)
 		return rc;
 	}
 
+	/*
+	 * play_time_ms comes from kzalloc (0) unless a debugfs store sets
+	 * it.  play() arms the stop hrtimer for play_time_ms, so 0 made
+	 * every play stop itself immediately and the led-brightness path
+	 * used by the AIDL HAL never produced any vibration.  Default to
+	 * the max duration; the HAL writes brightness 0 to stop early.
+	 */
+	chip->play_time_ms = chip->max_play_time_ms;
+
 	chip->vmax_mv = HAP_VMAX_MAX_MV;
 	rc = of_property_read_u32(node, "qcom,vmax-mv", &temp);
 	if (!rc) {
