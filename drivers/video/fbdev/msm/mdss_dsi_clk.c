@@ -207,9 +207,14 @@ static int dsi_link_hs_clk_set_rate(
 				link_hs_clks->byte_clk_rate ||
 		    vco_rate ==
 			8UL * (unsigned long)link_hs_clks->byte_clk_rate) {
-			pr_err("byte_clk hw ok (vco=%lu 8x req), ignoring rc=%d\n",
+			pr_err("byte_clk hw ok (vco=%lu 8x req) but clk_set_rate failed rc=%d\n",
 				vco_rate, rc);
-			rc = 0;
+			/*
+			 * 4.9 的语义是失败即返回。继续往下走会让 DSI 带着
+			 * 错误时钟运行，触发错误中断风暴并最终 SError，
+			 * 所以这里不再把失败吞掉。
+			 */
+			goto error;
 		} else {
 			pr_err("clk_set_rate for byte_clk unrecovered rc = %d\n",
 				rc);
@@ -220,12 +225,13 @@ static int dsi_link_hs_clk_set_rate(
 	rc = clk_set_rate(link_hs_clks->pixel_clk, link_hs_clks->pix_clk_rate);
 	if (rc) {
 		pr_err("clk_set_rate failed for pixel_clk rc = %d\n", rc);
-		if (rc == -EINVAL) {
-			pr_err("pixel_clk rcg freq mismatch, hw pll already programmed, ignoring\n");
-			rc = 0;
-		} else {
-			goto error;
-		}
+		/*
+		 * 4.9 在这里直接返回错误。之前忽略 -EINVAL 会让 DSI 带着
+		 * 错误的 pixel clock 继续跑，形成
+		 *   错误中断 → MDP_BUSY_RELEASE → 重提交 → 重设时钟失败
+		 * 的活锁，最终 SError panic 或显示驱动死等（黑屏）。
+		 */
+		goto error;
 	}
 
 	/*
