@@ -45,6 +45,14 @@ struct compat_ion_flush_data {
 #define COMPAT_ION_IOC_CLEAN_INV_CACHES	_IOWR(ION_IOC_MSM_MAGIC, 2, \
 					      struct compat_ion_flush_data)
 
+struct compat_ion_custom_data {
+	compat_uint_t cmd;
+	compat_uptr_t arg;
+};
+
+#define COMPAT_ION_IOC_CUSTOM	_IOWR(ION_IOC_MAGIC, 6, \
+				      struct compat_ion_custom_data)
+
 /* See drivers/staging/android/uapi/ion.h for the definition of these structs */
 struct compat_ion_old_allocation_data {
 	compat_size_t len;
@@ -194,7 +202,6 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case ION_IOC_MAP:
 	case ION_IOC_IMPORT:
 	case ION_IOC_SYNC:
-	case ION_IOC_SYNC_LEGACY:
 	case ION_IOC_ALLOC:
 	case ION_IOC_HEAP_QUERY:
 	case ION_IOC_PREFETCH:
@@ -256,5 +263,16 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			return ion_flush_buffer_fd(fd, dir);
 		}
 		return -ENOIOCTLCMD;
+	}
+	case COMPAT_ION_IOC_CUSTOM:
+	{
+		struct compat_ion_custom_data __user *d32 = compat_ptr(arg);
+		compat_uint_t mcmd;
+		compat_uptr_t uarg;
+
+		if (copy_from_user(&mcmd, &d32->cmd, sizeof(mcmd)) ||
+		    copy_from_user(&uarg, &d32->arg, sizeof(uarg)))
+			return -EFAULT;
+		return ion_legacy_cache_op(mcmd, (unsigned long)uarg);
 	}
 }
