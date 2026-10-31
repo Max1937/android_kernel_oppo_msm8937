@@ -824,7 +824,7 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 	}
 	if (enable) {
 		if (mi2s_gpio_prop) {
-			np_mi2s = of_parse_phandle(rtd->dev->of_node,
+			np_mi2s = of_parse_phandle(rtd->card->dev->of_node,
 					     mi2s_gpio_prop, 0);
 			if (np_mi2s) {
 				ret = msm_cdc_pinctrl_select_active_state(
@@ -878,7 +878,7 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 			pr_err("%s:afe_set_lpass_clock_v2 failed\n", __func__);
 	}
 	if (!enable && mi2s_gpio_prop) {
-		np_mi2s = of_parse_phandle(rtd->dev->of_node,
+		np_mi2s = of_parse_phandle(rtd->card->dev->of_node,
 					   mi2s_gpio_prop, 0);
 		if (np_mi2s) {
 			ret = msm_cdc_pinctrl_select_sleep_state(
