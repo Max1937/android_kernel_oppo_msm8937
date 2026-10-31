@@ -96,6 +96,14 @@ struct ion_handle_data {
  */
 #define ION_IOC_IMPORT		_IOWR(ION_IOC_MAGIC, 5, struct ion_fd_data)
 
+/**
+ * DOC: ION_IOC_SYNC - syncs a shared file descriptor to memory
+ *
+ * 4.9-era userspace calls this after touching a cached buffer from the
+ * cpu so the contents become coherent for the device.
+ */
+#define ION_IOC_SYNC		_IOWR(ION_IOC_MAGIC, 7, struct ion_fd_data)
+
 #endif /* CONFIG_ION_LEGACY */
 
 #endif /* _ION_LEGACY_H */
