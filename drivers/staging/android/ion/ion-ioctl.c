@@ -4,6 +4,8 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
@@ -15,10 +17,53 @@
 #include "ion_legacy.h"
 #endif
 
+
+/*
+ * Legacy Qualcomm flush API (ION_IOC_MSM_MAGIC 'M') used by old vendor
+ * gralloc/memalloc to keep CPU/GPU caches coherent on a dmabuf fd.
+ * CLEAN = writeback (DMA_TO_DEVICE), INV = invalidate (DMA_FROM_DEVICE),
+ * CLEAN_INV = both directions.
+ */
+int ion_flush_buffer_fd(int fd, enum dma_data_direction dir)
+{
+	struct dma_buf *dmabuf;
+	struct ion_buffer *buffer;
+	struct scatterlist *sg;
+	struct device *dev;
+	int i;
+
+	dmabuf = dma_buf_get(fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
+
+	buffer = dmabuf->priv;
+	if (!buffer || !buffer->sg_table) {
+		dma_buf_put(dmabuf);
+		return -EINVAL;
+	}
+
+	dev = buffer->dev->dev.this_device;
+
+	for_each_sg(buffer->sg_table->sgl, sg, buffer->sg_table->nents, i) {
+		if (dir == DMA_TO_DEVICE)
+			dma_sync_sg_for_device(dev, sg, 1, dir);
+		else if (dir == DMA_FROM_DEVICE)
+			dma_sync_sg_for_cpu(dev, sg, 1, dir);
+		else {
+			dma_sync_sg_for_cpu(dev, sg, 1, dir);
+			dma_sync_sg_for_device(dev, sg, 1, dir);
+		}
+	}
+
+	dma_buf_put(dmabuf);
+	return 0;
+}
+
 union ion_ioctl_arg {
 	struct ion_allocation_data allocation;
 	struct ion_heap_query query;
 	struct ion_prefetch_data prefetch_data;
+	struct ion_flush_data flush;
 #ifdef CONFIG_ION_LEGACY
 	struct ion_fd_data fd;
 	struct ion_old_allocation_data old_allocation;
@@ -128,6 +173,18 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			return ret;
 		break;
 	}
+	case ION_IOC_CLEAN_CACHES:
+		ret = ion_flush_buffer_fd(data.flush.fd,
+					  DMA_TO_DEVICE);
+		break;
+	case ION_IOC_INV_CACHES:
+		ret = ion_flush_buffer_fd(data.flush.fd,
+					  DMA_FROM_DEVICE);
+		break;
+	case ION_IOC_CLEAN_INV_CACHES:
+		ret = ion_flush_buffer_fd(data.flush.fd,
+					  DMA_BIDIRECTIONAL);
+		break;
 #ifdef CONFIG_ION_LEGACY
 	case ION_OLD_IOC_ALLOC:
 	{
