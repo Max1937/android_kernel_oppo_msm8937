@@ -542,6 +542,8 @@ struct sensorb_cfg_data_legacy32 {
 #define VIDIOC_MSM_SENSOR_CFG_LEGACY32 \
 	_IOWR('V', BASE_VIDIOC_PRIVATE + 1, struct sensorb_cfg_data_legacy32)
 
+static int msm_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl, void *argp);
+
 static long msm_sensor_config_legacy32(struct v4l2_subdev *sd, void *arg)
 {
 	struct msm_sensor_ctrl_t *s_ctrl = get_sctrl(sd);
