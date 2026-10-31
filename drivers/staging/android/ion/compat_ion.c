@@ -63,20 +63,28 @@ struct compat_ion_handle_data {
 #define COMPAT_ION_IOC_FREE	_IOWR(ION_IOC_MAGIC, 1, \
 				      struct compat_ion_handle_data)
 
-#define COMPAT_ION_IOC_CLEAN_CACHES	_IOWR(ION_IOC_MSM_MAGIC, 0, \
-					      struct compat_ion_flush_data)
-#define COMPAT_ION_IOC_INV_CACHES	_IOWR(ION_IOC_MSM_MAGIC, 1, \
-					      struct compat_ion_flush_data)
-#define COMPAT_ION_IOC_CLEAN_INV_CACHES	_IOWR(ION_IOC_MSM_MAGIC, 2, \
-					      struct compat_ion_flush_data)
+static int compat_get_ion_flush_fd(struct compat_ion_flush_data __user *data32)
+{
+	compat_int_t fd, handle;
+	int ret;
 
-struct compat_ion_flush_data {
-	compat_int_t handle;
-	compat_int_t fd;
-	compat_uptr_t vaddr;
-	compat_uint_t offset;
-	compat_uint_t length;
-};
+	ret = get_user(fd, &data32->fd);
+	if (ret)
+		return ret;
+
+	/*
+	 * Pre-4.12 clients keep the dma-buf fd they got from the legacy
+	 * alloc ioctl in the handle field; the fd field stays empty.
+	 */
+	if (!fd) {
+		ret = get_user(handle, &data32->handle);
+		if (ret)
+			return ret;
+		fd = handle;
+	}
+
+	return fd;
+}
 
 static int compat_get_ion_allocation_data(
 			struct compat_ion_old_allocation_data __user *data32,
@@ -110,31 +118,6 @@ static int compat_get_ion_handle_data(
 
 	err = get_user(i, &data32->handle);
 	err |= put_user(i, &data->handle);
-
-	return err;
-}
-
-static int compat_get_ion_flush_data(
-			struct compat_ion_flush_data __user *data32,
-			struct ion_flush_data __user *data)
-{
-	compat_int_t i;
-	compat_uptr_t u;
-	compat_uint_t l;
-	int err;
-
-	err = get_user(i, &data32->handle);
-	err |= put_user(i, &data->handle);
-	err |= get_user(i, &data32->fd);
-	err |= put_user(i, &data->fd);
-	err |= get_user(u, &data32->vaddr);
-	/* upper bits won't get set, zero them */
-	err |= put_user(0, &data->vaddr);
-	err |= put_user(u, (compat_uptr_t __user *)&data->vaddr);
-	err |= get_user(l, &data32->offset);
-	err |= put_user(l, &data->offset);
-	err |= get_user(l, &data32->length);
-	err |= put_user(l, &data->length);
 
 	return err;
 }
@@ -207,39 +190,6 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return filp->f_op->unlocked_ioctl(filp, ION_IOC_FREE,
 							(unsigned long)data);
 	}
-	case COMPAT_ION_IOC_CLEAN_CACHES:
-	case COMPAT_ION_IOC_INV_CACHES:
-	case COMPAT_ION_IOC_CLEAN_INV_CACHES:
-	{
-		struct compat_ion_flush_data __user *data32;
-		struct ion_flush_data __user *data;
-		unsigned int cmd64;
-		int err;
-
-		data32 = compat_ptr(arg);
-		data = compat_alloc_user_space(sizeof(*data));
-		if (!data)
-			return -EFAULT;
-
-		err = compat_get_ion_flush_data(data32, data);
-		if (err)
-			return err;
-
-		switch (cmd) {
-		case COMPAT_ION_IOC_CLEAN_CACHES:
-			cmd64 = ION_IOC_CLEAN_CACHES;
-			break;
-		case COMPAT_ION_IOC_INV_CACHES:
-			cmd64 = ION_IOC_INV_CACHES;
-			break;
-		default:
-			cmd64 = ION_IOC_CLEAN_INV_CACHES;
-			break;
-		}
-
-		return filp->f_op->unlocked_ioctl(filp, cmd64,
-						(unsigned long)data);
-	}
 	case ION_IOC_SHARE:
 	case ION_IOC_MAP:
 	case ION_IOC_IMPORT:
@@ -255,7 +205,7 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case COMPAT_ION_IOC_CLEAN_INV_CACHES: {
 		struct compat_ion_flush_data __user *data32 =
 			compat_ptr(arg);
-		compat_int_t fd;
+		int fd;
 		enum dma_data_direction dir;
 
 		if (cmd == COMPAT_ION_IOC_CLEAN_CACHES)
@@ -265,8 +215,9 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		else
 			dir = DMA_BIDIRECTIONAL;
 
-		if (get_user(fd, &data32->fd))
-			return -EFAULT;
+		fd = compat_get_ion_flush_fd(data32);
+		if (fd < 0)
+			return fd;
 
 		return ion_flush_buffer_fd(fd, dir);
 	}
@@ -280,7 +231,7 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (_IOC_TYPE(cmd) == ION_IOC_MSM_MAGIC) {
 			struct compat_ion_flush_data __user *data32 =
 				compat_ptr(arg);
-			compat_int_t fd;
+			int fd;
 			enum dma_data_direction dir;
 
 			switch (_IOC_NR(cmd)) {
@@ -297,8 +248,9 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				return -ENOIOCTLCMD;
 			}
 
-			if (get_user(fd, &data32->fd))
-				return -EFAULT;
+			fd = compat_get_ion_flush_fd(data32);
+			if (fd < 0)
+				return fd;
 
 			return ion_flush_buffer_fd(fd, dir);
 		}
