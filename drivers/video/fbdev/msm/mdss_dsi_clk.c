@@ -168,6 +168,33 @@ static int dsi_link_hs_clk_set_rate(
 	if (ctrl->panel_data.panel_info.cont_splash_enabled)
 		return 0;
 
+	/*
+	 * 唤醒后 DSI PLL 已下电，RCG（byte0_clk_src）的父时钟
+	 * ext_byte0_clk_src 速率为 0，clk_ops_byte_multiparent 无法算出分频比，
+	 * clk_set_rate 只会返回 -EINVAL（实测每秒刷几十条，面板因此拿不到有效
+	 * 像素时钟：有背光、能触摸，但没有图像）。
+	 *
+	 * 这里先把 PLL 侧编到目标速率：byte_clk 的父是 byte0_clk_src，祖父是
+	 * ext_byte0_clk_src，而 ext_byte0_clk_src 的父才是 dsi_pll0_byte_clk_src。
+	 * 对 ext_byte0_clk_src 设速率会顺着 CLK_SET_RATE_PARENT 传到 PLL，
+	 * 之后再设 RCG 速率就能成功。
+	 */
+	{
+		struct clk *byte_rcg = clk_get_parent(link_hs_clks->byte_clk);
+		struct clk *byte_pll_src = byte_rcg ? clk_get_parent(byte_rcg)
+						    : NULL;
+
+		if (byte_pll_src) {
+			int prc = clk_set_rate(byte_pll_src,
+					link_hs_clks->byte_clk_rate);
+
+			pr_debug("%s: pre-set %s to %u rc=%d (now %lu)\n",
+				 __func__, byte_pll_src->dbg_name,
+				 link_hs_clks->byte_clk_rate, prc,
+				 clk_get_rate(byte_pll_src));
+		}
+	}
+
 	rc = clk_set_rate(link_hs_clks->byte_clk, link_hs_clks->byte_clk_rate);
 	if (rc) {
 		unsigned long vco_rate = mdss_dsi_pll_lpm_get_vco_rate0();
