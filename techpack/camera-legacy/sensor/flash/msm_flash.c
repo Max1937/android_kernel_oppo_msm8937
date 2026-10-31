@@ -18,6 +18,7 @@
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
+#include <linux/cred.h>
 #include "msm_flash.h"
 #include "msm_camera_dt_util.h"
 #include "msm_cci.h"
@@ -137,6 +138,8 @@ static int qcom_flash_torch_state;
 static void qcom_flash_led_set(int on)
 {
 	struct file *f;
+	const struct cred *old_cred;
+	struct cred *cred;
 	const char *val = on ? "255" : "0";
 	int len = on ? 3 : 1;
 
@@ -145,15 +148,30 @@ static void qcom_flash_led_set(int on)
 		return;
 	}
 
+	/*
+	 * 写 proc 的是 vendor HAL（uid 1000/1047），直接用它的凭据 open
+	 * root:root 0644 的 LED 节点会被 VFS 拒绝（-EACCES，实测 -13），
+	 * 所以临时切到内核 root 凭据再操作。
+	 */
+	cred = prepare_kernel_cred(NULL);
+	if (!cred) {
+		pr_err("%s: no memory for cred\n", __func__);
+		return;
+	}
+	old_cred = override_creds(cred);
+
 	f = filp_open("/sys/class/leds/led:torch_0/brightness", O_WRONLY, 0);
 	if (IS_ERR(f)) {
 		pr_err("%s: cannot open torch led node (%ld)\n", __func__,
 		       PTR_ERR(f));
-		return;
+	} else {
+		kernel_write(f, val, len, &f->f_pos);
+		filp_close(f, NULL);
+		pr_info("%s: torch %s via sysfs\n", __func__, on ? "on" : "off");
 	}
-	kernel_write(f, val, len, &f->f_pos);
-	filp_close(f, NULL);
-	pr_info("%s: torch %s via sysfs\n", __func__, on ? "on" : "off");
+
+	revert_creds(old_cred);
+	put_cred(cred);
 }
 
 static ssize_t qcom_flash_proc_read(struct file *file, char __user *buff,
