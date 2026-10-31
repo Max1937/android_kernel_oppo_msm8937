@@ -196,6 +196,37 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return ion_flush_buffer_fd(fd, dir);
 	}
 	default:
+		/*
+		 * Legacy Qualcomm flush commands. The vendor gralloc was
+		 * built against a different struct layout than the one
+		 * we declare, so match on the command number instead of
+		 * the encoded size.
+		 */
+		if (_IOC_TYPE(cmd) == ION_IOC_MSM_MAGIC) {
+			struct compat_ion_flush_data __user *data32 =
+				compat_ptr(arg);
+			compat_int_t fd;
+			enum dma_data_direction dir;
+
+			switch (_IOC_NR(cmd)) {
+			case 0:
+				dir = DMA_TO_DEVICE;
+				break;
+			case 1:
+				dir = DMA_FROM_DEVICE;
+				break;
+			case 2:
+				dir = DMA_BIDIRECTIONAL;
+				break;
+			default:
+				return -ENOIOCTLCMD;
+			}
+
+			if (get_user(fd, &data32->fd))
+				return -EFAULT;
+
+			return ion_flush_buffer_fd(fd, dir);
+		}
 		return -ENOIOCTLCMD;
 	}
 }
