@@ -66,6 +66,7 @@ union ion_ioctl_arg {
 	struct ion_flush_data flush;
 #ifdef CONFIG_ION_LEGACY
 	struct ion_fd_data fd;
+	struct ion_fd_data_legacy fd_legacy;
 	struct ion_old_allocation_data old_allocation;
 	struct ion_handle_data handle;
 #endif
@@ -230,6 +231,19 @@ long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						  DMA_BIDIRECTIONAL);
 		else
 			ret = ion_flush_buffer_fd(data.fd.handle,
+						  DMA_BIDIRECTIONAL);
+		break;
+	case ION_IOC_SYNC_LEGACY:
+		/*
+		 * 4.9 vendor userspace syncs with cmd nr 6 over the
+		 * 16-byte ion_fd_data_legacy; same semantics as the
+		 * nr 7 form above.
+		 */
+		if (data.fd_legacy.fd)
+			ret = ion_flush_buffer_fd(data.fd_legacy.fd,
+						  DMA_BIDIRECTIONAL);
+		else
+			ret = ion_flush_buffer_fd(data.fd_legacy.handle,
 						  DMA_BIDIRECTIONAL);
 		break;
 #endif
