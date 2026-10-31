@@ -2137,7 +2137,7 @@ static const struct snd_soc_component_driver soc_msm_dig_codec = {
 
 const struct regmap_config msm_digital_regmap_config = {
 	.reg_bits = 32,
-	.reg_stride = 4,
+	.reg_stride = 1,
 	.val_bits = 8,
 	.lock = enable_digital_callback,
 	.unlock = disable_digital_callback,
