@@ -3288,7 +3288,24 @@ static bool mdss_dsi_fifo_status(struct mdss_dsi_ctrl_pdata *ctrl)
 	if (status & 0xcccc4409) {
 		MIPI_OUTP(base + 0x000c, status);
 
-		pr_err("%s: status=%x\n", __func__, status);
+		/*
+		 * A broken resume can flood this interrupt tens of thousands
+		 * of times per second; printing every hit flushes the whole
+		 * ring buffer before the resume sequence itself gets logged.
+		 * Report at most once a second with a suppression counter.
+		 */
+		{
+			static unsigned long last_jif;
+			static unsigned int flood_cnt;
+
+			flood_cnt++;
+			if (time_after(jiffies, last_jif + HZ)) {
+				pr_err("%s: status=%x (%u hits suppressed)\n",
+					__func__, status, flood_cnt);
+				last_jif = jiffies;
+				flood_cnt = 0;
+			}
+		}
 
 		/*
 		 * if DSI FIFO overflow is masked,
