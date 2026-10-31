@@ -186,7 +186,11 @@ static int msm8952_mclk_event(struct snd_soc_dapm_widget *w,
 			}
 		}
 		msm8952_enable_dig_cdc_clk(component, 1, true);
-		msm_anlg_cdc_mclk_enable(component, 1, true);
+		if (!pdata->codec_comp)
+			pr_err("%s: analog codec component missing\n",
+				__func__);
+		else
+			msm_anlg_cdc_mclk_enable(pdata->codec_comp, 1, true);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		pr_debug("%s: mclk_res_ref = %d\n",
@@ -202,7 +206,8 @@ static int msm8952_mclk_event(struct snd_soc_dapm_widget *w,
 		}
 		pr_debug("%s: disabling MCLK\n", __func__);
 		/* disable the codec mclk config*/
-		msm_anlg_cdc_mclk_enable(component, 0, true);
+		if (pdata->codec_comp)
+			msm_anlg_cdc_mclk_enable(pdata->codec_comp, 0, true);
 		msm8952_enable_dig_cdc_clk(component, 0, true);
 		break;
 	default:
@@ -1332,20 +1337,17 @@ static int msm_mi2s_snd_startup(struct snd_pcm_substream *substream)
 
 	/*
 	 * 4.9 parity: the msm8x16 machine driver called
-	 * msm8x16_wcd_mclk_enable(codec, 1, true) here, which runs the
-	 * PMIC clock block and raises A_CDC_CLK_PDM_CTL (the clock that
-	 * drives the PDM bus to the analog codec). Its 4.19 counterpart is
-	 * msm_anlg_cdc_mclk_enable, which raises DIG_CDC_EVENT_CLK_ON and
-	 * sets CDC_CORE_CLK_PDM_CTL. The fork dropped this call, so the
-	 * speaker gets no PDM clock and stays silent.
+	 * msm8x16_wcd_mclk_enable(codec, 1, true) in this path. In 4.19 the
+	 * clock pairing is owned by the MCLK supply widget
+	 * (msm8952_mclk_event), so only cache the analog codec component
+	 * here (dlc_rx1 = {dig, analog}, hence ANA_CDC = 1) and let the
+	 * event drive msm_anlg_cdc_mclk_enable() with the right component.
 	 */
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
 	    pdata->snd_card_val == INT_SND_CARD) {
-		struct snd_soc_component *anlg_cdc =
-			rtd->codec_dais[ANA_CDC]->component;
-
-		if (anlg_cdc)
-			msm_anlg_cdc_mclk_enable(anlg_cdc, 1, true);
+		if (rtd->num_codecs > ANA_CDC)
+			pdata->codec_comp =
+				rtd->codec_dais[ANA_CDC]->component;
 	}
 
 	return ret;
@@ -1356,7 +1358,6 @@ static void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	int ret;
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct snd_soc_card *card = rtd->card;
-	struct msm_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
 
 	pr_debug("%s(): substream = %s  stream = %d\n", __func__,
 			substream->name, substream->stream);
@@ -1365,14 +1366,6 @@ static void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		pr_err("%s:clock disable failed; ret=%d\n", __func__,
 				ret);
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
-	    pdata->snd_card_val == INT_SND_CARD) {
-		struct snd_soc_component *anlg_cdc =
-			rtd->codec_dais[ANA_CDC]->component;
-
-		if (anlg_cdc)
-			msm_anlg_cdc_mclk_enable(anlg_cdc, 0, true);
-	}
 	if (card->aux_dev && substream->stream ==
 			SNDRV_PCM_STREAM_PLAYBACK) {
 		ret = msm8952_enable_wsa_mclk(card, false);
