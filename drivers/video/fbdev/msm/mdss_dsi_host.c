@@ -3355,6 +3355,15 @@ static bool mdss_dsi_clk_status(struct mdss_dsi_ctrl_pdata *ctrl)
 	return ret;
 }
 
+/*
+ * Downstream panics when DSI error interrupts arrive too densely. On A57
+ * the resume path still has an open DSI lane/clock issue, and panicking
+ * turns a failed screen resume into a full reboot (user data loss). Keep
+ * the device alive and leave the first-error logs in ramoops for
+ * root-causing; flip this to restore the ramdump behavior.
+ */
+static bool dsi_error_panic;
+
 static void __dsi_error_counter(struct dsi_err_container *err_container)
 {
 	s64 prev_time, curr_time;
@@ -3372,10 +3381,13 @@ static void __dsi_error_counter(struct dsi_err_container *err_container)
 
 	if (prev_time &&
 		((curr_time - prev_time) < err_container->err_time_delta)) {
-		pr_err("%s: panic in WQ as dsi error intrs within:%dms\n",
-				__func__, err_container->err_time_delta);
-		MDSS_XLOG_TOUT_HANDLER_WQ("mdp", "dsi0_ctrl", "dsi0_phy",
-			"dsi1_ctrl", "dsi1_phy", "dsi_dbg_bus", "panic");
+		pr_err("%s: dsi error intrs within:%dms (panic %s)\n",
+				__func__, err_container->err_time_delta,
+				dsi_error_panic ? "on" : "suppressed");
+		if (dsi_error_panic)
+			MDSS_XLOG_TOUT_HANDLER_WQ("mdp", "dsi0_ctrl",
+				"dsi0_phy", "dsi1_ctrl", "dsi1_phy",
+				"dsi_dbg_bus", "panic");
 	}
 }
 
