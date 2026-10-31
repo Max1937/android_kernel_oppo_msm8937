@@ -118,7 +118,7 @@ static long msm_sensor_init_subdev_ioctl(struct v4l2_subdev *sd,
 		break;
 
 	default:
-		pr_err_ratelimited("default\n");
+		pr_err_ratelimited("default cmd=0x%x\n", cmd);
 		break;
 	}
 
@@ -188,52 +188,48 @@ static long msm_sensor_init_subdev_do_ioctl(
 			sizeof(sensor_init_data.entity_name));
 		return 0;
 	case VIDIOC_MSM_SENSOR_INIT_CFG_LEGACY32: {
-		struct sensor_init_cfg_data_legacy32 __user *u32l =
-			(struct sensor_init_cfg_data_legacy32 *)arg;
-		struct msm_sensor_info_t_legacy32 __user *info32;
+		/* arg is the video_usercopy kernel buffer, not user memory */
+		struct sensor_init_cfg_data_legacy32 *u32l = arg;
 		struct sensor_init_cfg_data sensor_init_data;
-		__u32 setting;
 		int i;
 
 		memset(&sensor_init_data, 0, sizeof(sensor_init_data));
-		if (get_user(sensor_init_data.cfgtype, &u32l->cfgtype) ||
-		    get_user(setting, &u32l->setting))
-			return -EFAULT;
-		sensor_init_data.cfg.setting = compat_ptr(setting);
+		sensor_init_data.cfgtype = u32l->cfgtype;
+		sensor_init_data.cfg.setting = compat_ptr(u32l->setting);
+		pr_info("LEGACY32 INIT_CFG cfgtype=%d\n",
+			sensor_init_data.cfgtype);
 
 		rc = msm_sensor_driver_cmd(s_init, &sensor_init_data);
-		if (rc < 0)
+		if (rc < 0) {
+			pr_info("LEGACY32 INIT_CFG rc=%d\n", (int)rc);
 			return rc;
+		}
 
 		/* copy the probed info back in the legacy 32-bit layout */
-		info32 = &u32l->probed_info;
-		copy_to_user(u32l->entity_name,
-				sensor_init_data.entity_name,
-				sizeof(sensor_init_data.entity_name));
-		copy_to_user(info32->sensor_name,
-				sensor_init_data.probed_info.sensor_name,
-				sizeof(sensor_init_data.probed_info.sensor_name));
-		copy_to_user(&info32->session_id,
-				&sensor_init_data.probed_info.session_id,
-				sizeof(info32->session_id));
+		memcpy(u32l->entity_name,
+			sensor_init_data.entity_name,
+			sizeof(sensor_init_data.entity_name));
+		memcpy(&u32l->probed_info.sensor_name,
+			&sensor_init_data.probed_info.sensor_name,
+			sizeof(u32l->probed_info.sensor_name));
+		u32l->probed_info.session_id =
+			sensor_init_data.probed_info.session_id;
 		for (i = 0; i < 12; i++) {
-			put_user(sensor_init_data.probed_info.subdev_id[i],
-				 &info32->subdev_id[i]);
-			put_user(sensor_init_data.probed_info.subdev_intf[i],
-				 &info32->subdev_intf[i]);
+			u32l->probed_info.subdev_id[i] =
+				sensor_init_data.probed_info.subdev_id[i];
+			u32l->probed_info.subdev_intf[i] =
+				sensor_init_data.probed_info.subdev_intf[i];
 		}
-		copy_to_user(&info32->is_mount_angle_valid,
-				&sensor_init_data.probed_info.is_mount_angle_valid,
-				sizeof(info32->is_mount_angle_valid));
-		copy_to_user(&info32->sensor_mount_angle,
-				&sensor_init_data.probed_info.sensor_mount_angle,
-				sizeof(info32->sensor_mount_angle));
-		copy_to_user(&info32->modes_supported,
-				&sensor_init_data.probed_info.modes_supported,
-				sizeof(info32->modes_supported));
-		copy_to_user(&info32->position,
-				&sensor_init_data.probed_info.position,
-				sizeof(info32->position));
+		u32l->probed_info.is_mount_angle_valid =
+			sensor_init_data.probed_info.is_mount_angle_valid;
+		u32l->probed_info.sensor_mount_angle =
+			sensor_init_data.probed_info.sensor_mount_angle;
+		u32l->probed_info.modes_supported =
+			sensor_init_data.probed_info.modes_supported;
+		u32l->probed_info.position =
+			sensor_init_data.probed_info.position;
+		pr_info("LEGACY32 INIT_CFG done entity=%s\n",
+			sensor_init_data.entity_name);
 		return 0;
 	}
 	default:
