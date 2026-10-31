@@ -3,6 +3,7 @@
 
 #define pr_fmt(fmt) "mdss-dsi-clk:[%s] " fmt, __func__
 #include <linux/clk.h>
+#include <linux/clk/msm-clk-provider.h>
 #include <linux/list.h>
 
 #include "mdss_dsi_clk.h"
@@ -170,10 +171,17 @@ static int dsi_link_hs_clk_set_rate(
 	rc = clk_set_rate(link_hs_clks->byte_clk, link_hs_clks->byte_clk_rate);
 	if (rc) {
 		unsigned long vco_rate = mdss_dsi_pll_lpm_get_vco_rate0();
-		int mult;
+		struct clk *mux = clk_get_parent(link_hs_clks->byte_clk);
+		struct clk *vco = mux ? clk_get_parent(mux) : NULL;
 
-		pr_err("clk_set_rate failed for byte_clk rc = %d req = %u vco_cached = %lu\n",
-			rc, link_hs_clks->byte_clk_rate, vco_rate);
+		pr_err("byte_clk=%s rc=%d req=%u cur=%lu mux=%s/%lu vco=%s/%lu cached=%lu\n",
+			link_hs_clks->byte_clk->dbg_name, rc,
+			link_hs_clks->byte_clk_rate,
+			clk_get_rate(link_hs_clks->byte_clk),
+			mux ? mux->dbg_name : "null",
+			mux ? clk_get_rate(mux) : 0UL,
+			vco ? vco->dbg_name : "null",
+			vco ? clk_get_rate(vco) : 0UL, vco_rate);
 
 		/*
 		 * The direct path (4x VCO) is impossible below the 350MHz PLL
@@ -195,8 +203,16 @@ static int dsi_link_hs_clk_set_rate(
 				pr_err("byte_clk recovered via indirect path\n");
 		}
 		if (rc) {
-			pr_err("clk_set_rate for byte_clk unrecovered rc = %d\n", rc);
-			goto error;
+			if (clk_get_rate(link_hs_clks->byte_clk) ==
+					link_hs_clks->byte_clk_rate) {
+				pr_err("byte_clk cache already %u, ignoring -22\n",
+					link_hs_clks->byte_clk_rate);
+				rc = 0;
+			} else {
+				pr_err("clk_set_rate for byte_clk unrecovered rc = %d\n",
+					rc);
+				goto error;
+			}
 		}
 	}
 
