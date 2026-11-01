@@ -1607,8 +1607,9 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 		mdss_dsi_validate_debugfs_info(ctrl_pdata);
 
 	cur_power_state = pdata->panel_info.panel_power_state;
-	pr_debug("%s+: ctrl=%pK ndx=%d cur_power_state=%d\n", __func__,
-		ctrl_pdata, ctrl_pdata->ndx, cur_power_state);
+	pr_info("%s+: ndx=%d cur_power_state=%d interactive=%d\n", __func__,
+		ctrl_pdata->ndx, cur_power_state,
+		mdss_dsi_is_panel_on_interactive(pdata));
 
 	pinfo = &pdata->panel_info;
 	mipi = &pdata->panel_info.mipi;
@@ -1621,7 +1622,7 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 		 * sent to panel
 		 */
 		mdss_dsi_restore_intr_mask(ctrl_pdata);
-		pr_debug("%s: panel already on\n", __func__);
+		pr_info("%s: PANEL ALREADY ON, skipping full init\n", __func__);
 		goto end;
 	}
 
@@ -1632,7 +1633,7 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 	}
 
 	if (mdss_panel_is_power_on(cur_power_state)) {
-		pr_debug("%s: dsi_on from panel low power state\n", __func__);
+		pr_info("%s: POWER STILL ON, skipping phy/ctrl setup\n", __func__);
 		goto end;
 	}
 
