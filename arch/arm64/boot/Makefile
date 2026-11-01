@@ -27,7 +27,6 @@ else
 DTB_LIST := $(dtb-y)
 endif
 DTB_OBJS := $(shell find $(obj)/dts/ -name \*.dtb)
-DTB_OBJS += $(srctree)/tools/dtb/msm8940-a57.dtb
 
 # Add RTIC DTB to the DTB list if RTIC MPGen is enabled
 # Note, we keep this for compatibility with
