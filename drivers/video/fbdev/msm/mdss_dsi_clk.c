@@ -181,31 +181,23 @@ static int dsi_link_hs_clk_set_rate(
 	 */
 	{
 		struct clk *byte_rcg = clk_get_parent(link_hs_clks->byte_clk);
-		struct clk *ext = clk_get(NULL, "ext_byte0_clk_src");
+		struct clk *ext = byte_rcg ? clk_get_parent(byte_rcg) : NULL;
 
 		/*
-		 * 注意：不能用 clk_get_parent(byte_rcg) 去取父时钟 ——
-		 * 唤醒后它正好是 NULL（这正是要修的问题），那样整段会被跳过。
-		 * 按名字取 ext_byte0_clk_src（它的父才是 dsi_pll0_byte_clk_src）。
+		 * GCC MDSS 驱动现在会在 probe 时把 byte0_clk_src 的父设成
+		 * ext_byte0_clk_src，所以这里 clk_get_parent 链是有效的。
 		 */
-		if (byte_rcg && !IS_ERR_OR_NULL(ext)) {
-			int prc = clk_set_parent(byte_rcg, ext);
+		if (ext) {
+			int prc = clk_set_rate(ext,
+					link_hs_clks->byte_clk_rate);
 
-			pr_info("%s: set_parent(%s <- %s) rc=%d\n", __func__,
-				byte_rcg->dbg_name, ext->dbg_name, prc);
-
-			if (!prc) {
-				prc = clk_set_rate(ext,
-						link_hs_clks->byte_clk_rate);
-				pr_info("%s: set_rate(%s, %u) rc=%d, rcg now %lu, ext now %lu\n",
-					__func__, ext->dbg_name,
-					link_hs_clks->byte_clk_rate, prc,
-					clk_get_rate(byte_rcg),
-					clk_get_rate(ext));
-			}
-			clk_put(ext);
+			pr_info("%s: pre-set(%s, %u) rc=%d, rcg=%lu ext=%lu\n",
+				__func__, ext->dbg_name,
+				link_hs_clks->byte_clk_rate, prc,
+				clk_get_rate(byte_rcg),
+				clk_get_rate(ext));
 		} else {
-			pr_info("%s: cannot resolve ext_byte0_clk_src (rcg=%p)\n",
+			pr_info("%s: byte rcg parent still NULL (rcg=%p)\n",
 				__func__, byte_rcg);
 		}
 	}
