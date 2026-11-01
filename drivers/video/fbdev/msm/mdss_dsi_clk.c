@@ -181,31 +181,32 @@ static int dsi_link_hs_clk_set_rate(
 	 */
 	{
 		struct clk *byte_rcg = clk_get_parent(link_hs_clks->byte_clk);
-		struct clk *byte_pll_src = byte_rcg ? clk_get_parent(byte_rcg)
-						    : NULL;
+		struct clk *ext = clk_get(NULL, "ext_byte0_clk_src");
 
-		if (byte_pll_src) {
-			int prc;
+		/*
+		 * 注意：不能用 clk_get_parent(byte_rcg) 去取父时钟 ——
+		 * 唤醒后它正好是 NULL（这正是要修的问题），那样整段会被跳过。
+		 * 按名字取 ext_byte0_clk_src（它的父才是 dsi_pll0_byte_clk_src）。
+		 */
+		if (byte_rcg && !IS_ERR_OR_NULL(ext)) {
+			int prc = clk_set_parent(byte_rcg, ext);
 
-			/*
-			 * RCG 在时钟框架里的 parent 指针可能还没建立
-			 * （debugfs 的 parent 读的是硬件 mux 寄存器，不是同一个东西）。
-			 * parent 为 NULL 时 clk_get_rate(parent) 返回 0，
-			 * clk_ops_byte_multiparent 算不出分频比，set_rate 恒 -EINVAL。
-			 * 这里先把父指针建起来，再设速率。
-			 */
-			prc = clk_set_parent(byte_rcg, byte_pll_src);
 			pr_info("%s: set_parent(%s <- %s) rc=%d\n", __func__,
-				byte_rcg->dbg_name, byte_pll_src->dbg_name, prc);
+				byte_rcg->dbg_name, ext->dbg_name, prc);
 
-			prc = clk_set_rate(byte_pll_src,
-					link_hs_clks->byte_clk_rate);
-
-			pr_info("%s: pre-set %s to %u rc=%d (now %lu), rcg now %lu\n",
-				__func__, byte_pll_src->dbg_name,
-				link_hs_clks->byte_clk_rate, prc,
-				clk_get_rate(byte_pll_src),
-				clk_get_rate(byte_rcg));
+			if (!prc) {
+				prc = clk_set_rate(ext,
+						link_hs_clks->byte_clk_rate);
+				pr_info("%s: set_rate(%s, %u) rc=%d, rcg now %lu, ext now %lu\n",
+					__func__, ext->dbg_name,
+					link_hs_clks->byte_clk_rate, prc,
+					clk_get_rate(byte_rcg),
+					clk_get_rate(ext));
+			}
+			clk_put(ext);
+		} else {
+			pr_info("%s: cannot resolve ext_byte0_clk_src (rcg=%p)\n",
+				__func__, byte_rcg);
 		}
 	}
 
