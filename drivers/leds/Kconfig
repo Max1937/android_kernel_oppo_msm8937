@@ -807,14 +807,6 @@ config LEDS_QPNP_FLASH_V2
           flash LED target current for several independent channels.  It also
           supports various over current and over temperature mitigation features.
 
-config LEDS_QPNP_HAPTICS
-	tristate "Haptics support for QPNP PMIC"
-	depends on LEDS_CLASS && SPMI
-	help
-	  This option enables support for the haptics peripheral on
-	  Qualcomm QPNP PMICs, providing a LED-class vibrator with
-	  waveform and direct play modes.
-
 config LEDS_QPNP_VIBRATOR_LDO
 	tristate "Vibrator-LDO support for QPNP PMIC"
 	depends on LEDS_CLASS && MFD_SPMI_PMIC
