@@ -180,25 +180,33 @@ static int dsi_link_hs_clk_set_rate(
 	 * 之后再设 RCG 速率就能成功。
 	 */
 	{
-		struct clk *byte_rcg = clk_get_parent(link_hs_clks->byte_clk);
-		struct clk *ext = byte_rcg ? clk_get_parent(byte_rcg) : NULL;
+		struct dsi_shared_data *sdata = ctrl->shared_data;
+		struct clk *rcg = ctrl->byte_clk_rcg;
+		struct clk *ext = sdata ? sdata->ext_byte0_clk : NULL;
 
 		/*
-		 * GCC MDSS 驱动现在会在 probe 时把 byte0_clk_src 的父设成
-		 * ext_byte0_clk_src，所以这里 clk_get_parent 链是有效的。
+		 * 唤醒后 RCG 的父链丢失：clk_get_parent(byte0_clk_src) 返回 NULL，
+		 * clk_get(NULL, "ext_byte0_clk_src") 又查不到（clkdev 别名表没有）。
+		 * 但 DSI 驱动 probe 时就持有了 RCG 和它的正确父时钟这两个指针
+		 * （mdss_dsi_set_clk_src() 也是用它们），所以直接拿指针重建父链。
 		 */
-		if (ext) {
-			int prc = clk_set_rate(ext,
-					link_hs_clks->byte_clk_rate);
+		if (rcg && ext) {
+			int prc = clk_set_parent(rcg, ext);
 
-			pr_info("%s: pre-set(%s, %u) rc=%d, rcg=%lu ext=%lu\n",
-				__func__, ext->dbg_name,
-				link_hs_clks->byte_clk_rate, prc,
-				clk_get_rate(byte_rcg),
-				clk_get_rate(ext));
+			pr_info("%s: re-parent %s <- %s rc=%d\n", __func__,
+				rcg->dbg_name, ext->dbg_name, prc);
+
+			if (!prc) {
+				prc = clk_set_rate(ext,
+						link_hs_clks->byte_clk_rate);
+				pr_info("%s: set_rate(%s,%u) rc=%d, rcg now %lu ext now %lu\n",
+					__func__, ext->dbg_name,
+					link_hs_clks->byte_clk_rate, prc,
+					clk_get_rate(rcg), clk_get_rate(ext));
+			}
 		} else {
-			pr_info("%s: byte rcg parent still NULL (rcg=%p)\n",
-				__func__, byte_rcg);
+			pr_info("%s: rcg=%p ext=%p (sdata=%p)\n",
+				__func__, rcg, ext, sdata);
 		}
 	}
 
