@@ -168,48 +168,6 @@ static int dsi_link_hs_clk_set_rate(
 	if (ctrl->panel_data.panel_info.cont_splash_enabled)
 		return 0;
 
-	/*
-	 * 唤醒后 DSI PLL 已下电，RCG（byte0_clk_src）的父时钟
-	 * ext_byte0_clk_src 速率为 0，clk_ops_byte_multiparent 无法算出分频比，
-	 * clk_set_rate 只会返回 -EINVAL（实测每秒刷几十条，面板因此拿不到有效
-	 * 像素时钟：有背光、能触摸，但没有图像）。
-	 *
-	 * 这里先把 PLL 侧编到目标速率：byte_clk 的父是 byte0_clk_src，祖父是
-	 * ext_byte0_clk_src，而 ext_byte0_clk_src 的父才是 dsi_pll0_byte_clk_src。
-	 * 对 ext_byte0_clk_src 设速率会顺着 CLK_SET_RATE_PARENT 传到 PLL，
-	 * 之后再设 RCG 速率就能成功。
-	 */
-	{
-		struct dsi_shared_data *sdata = ctrl->shared_data;
-		struct clk *rcg = ctrl->byte_clk_rcg;
-		struct clk *ext = sdata ? sdata->ext_byte0_clk : NULL;
-
-		/*
-		 * 唤醒后 RCG 的父链丢失：clk_get_parent(byte0_clk_src) 返回 NULL，
-		 * clk_get(NULL, "ext_byte0_clk_src") 又查不到（clkdev 别名表没有）。
-		 * 但 DSI 驱动 probe 时就持有了 RCG 和它的正确父时钟这两个指针
-		 * （mdss_dsi_set_clk_src() 也是用它们），所以直接拿指针重建父链。
-		 */
-		if (rcg && ext) {
-			int prc = clk_set_parent(rcg, ext);
-
-			pr_info("%s: re-parent %s <- %s rc=%d\n", __func__,
-				rcg->dbg_name, ext->dbg_name, prc);
-
-			if (!prc) {
-				prc = clk_set_rate(ext,
-						link_hs_clks->byte_clk_rate);
-				pr_info("%s: set_rate(%s,%u) rc=%d, rcg now %lu ext now %lu\n",
-					__func__, ext->dbg_name,
-					link_hs_clks->byte_clk_rate, prc,
-					clk_get_rate(rcg), clk_get_rate(ext));
-			}
-		} else {
-			pr_info("%s: rcg=%p ext=%p (sdata=%p)\n",
-				__func__, rcg, ext, sdata);
-		}
-	}
-
 	rc = clk_set_rate(link_hs_clks->byte_clk, link_hs_clks->byte_clk_rate);
 	if (rc) {
 		unsigned long vco_rate = mdss_dsi_pll_lpm_get_vco_rate0();
