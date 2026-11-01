@@ -422,14 +422,21 @@ static struct div_clk dsi_pll1_byte_clk_src = {
 	},
 };
 
+/*
+ * 4.19 的 DTB 用 CCF 枚举小索引引用 DSI PLL 时钟（BYTECLK_SRC_0_CLK=4,
+ * PCLK_SRC_0_CLK=5, BYTECLK_SRC_1_CLK=10, PCLK_SRC_1_CLK=11），而
+ * CLK_LIST() 的 .of_idx 来自 msm-clocks-8952.h 的巨大 ID（如
+ * 0x44539836），两者不匹配会导致 devm_clk_get("ext_byte0_clk") 返回
+ * -ENOENT。这里显式把 .of_idx 对齐到 CCF 枚举值。
+ */
 static struct clk_lookup dsi_pll0_cc[] = {
-	CLK_LIST(dsi_pll0_pixel_clk_src),
-	CLK_LIST(dsi_pll0_byte_clk_src),
+	{ .clk = &dsi_pll0_byte_clk_src.c,  .of_idx = 4 },  /* BYTECLK_SRC_0_CLK */
+	{ .clk = &dsi_pll0_pixel_clk_src.c, .of_idx = 5 },  /* PCLK_SRC_0_CLK */
 };
 
 static struct clk_lookup dsi_pll1_cc[] = {
-	CLK_LIST(dsi_pll1_pixel_clk_src),
-	CLK_LIST(dsi_pll1_byte_clk_src),
+	{ .clk = &dsi_pll1_byte_clk_src.c,  .of_idx = 10 }, /* BYTECLK_SRC_1_CLK */
+	{ .clk = &dsi_pll1_pixel_clk_src.c, .of_idx = 11 }, /* PCLK_SRC_1_CLK */
 };
 
 int dsi_pll_clock_register_lpm(struct platform_device *pdev,
