@@ -261,9 +261,17 @@ static void qcom_flash_led_set(int on)
 	if (level > qcom_torch_led->max_brightness)
 		level = qcom_torch_led->max_brightness;
 
-	if (qcom_switch_led)
-		led_set_brightness(qcom_switch_led,
-				   qcom_switch_led->max_brightness);
+	/*
+	 * switch 是闪光灯的供电/使能档（led:switch）。只有真要亮的时候才拉满，
+	 * 5/6 这种“状态写法”不要把它打开，否则 rail 一直使能白耗电。
+	 */
+	if (qcom_switch_led) {
+		if (level >= 100)
+			led_set_brightness(qcom_switch_led,
+					   qcom_switch_led->max_brightness);
+		else
+			led_set_brightness(qcom_switch_led, LED_OFF);
+	}
 	led_set_brightness(qcom_torch_led, level);
 
 	pr_info("torch level %d -> brightness %d (max %d)\n",
