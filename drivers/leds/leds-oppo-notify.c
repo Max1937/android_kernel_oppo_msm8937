@@ -42,6 +42,7 @@ static int setup_retries;
 static void white_brightness_set(struct led_classdev *cdev,
 				 enum led_brightness value)
 {
+	pr_info("oppo_notify: white brightness <- %d\n", value);
 	if (!red_led)
 		return;
 	if (red_led->brightness_set)
@@ -124,6 +125,7 @@ static ssize_t grpfreq_store(struct device *dev, struct device_attribute *attr,
 	if (val > 10000)
 		val = 10000;
 	blink_freq_ms = val;
+	pr_info("oppo_notify: grpfreq <- %u\n", val);
 	if (blinking)
 		mod_timer(&blink_timer, jiffies + msecs_to_jiffies(10));
 	return count;
@@ -145,6 +147,8 @@ static ssize_t grppwm_store(struct device *dev, struct device_attribute *attr,
 	if (val > 100)
 		val = 100;
 	blink_duty = val;
+	pr_info("oppo_notify: grppwm <- %u (duty %u%%)\n",
+		blink_duty, val);
 	return count;
 }
 
