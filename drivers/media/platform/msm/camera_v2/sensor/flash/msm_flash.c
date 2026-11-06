@@ -45,6 +45,44 @@ static struct msm_flash_table *flash_table[] = {
 	&msm_pmic_flash_table
 };
 
+static void msm_torch_brightness_set(struct led_classdev *led_cdev,
+				enum led_brightness value);
+
+/*
+ * 4.9 那颗 OPPO 内核（4.9.337-lineageos-g453b4f5b8322-dirty）里，
+ * torch 的 led classdev 上还有一个 "flash_on_off" 属性（内核字符串里
+ * "torch-light1" 紧跟 "flash_on_off"），4.19 移植时丢了。
+ * vendor daemon 可能会去找它，先把 4.9 的接口补回来：
+ *   cat  -> 当前亮度
+ *   echo 1/0 -> 开/关手电筒（走本驱动自己的 torch_trigger）
+ */
+static ssize_t flash_on_off_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+
+	return scnprintf(buf, 32, "%d\n", cdev ? cdev->brightness : 0);
+}
+
+static ssize_t flash_on_off_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	long val;
+
+	if (!cdev)
+		return -ENODEV;
+	if (kstrtol(buf, 0, &val))
+		return -EINVAL;
+
+	pr_info("flash_on_off: %s <- %ld\n", cdev->name, val);
+	msm_torch_brightness_set(cdev, val ? LED_FULL : LED_OFF);
+	return count;
+}
+
+static DEVICE_ATTR_RW(flash_on_off);
+
 static struct msm_camera_i2c_fn_t msm_sensor_cci_func_tbl = {
 	.i2c_read = msm_camera_cci_i2c_read,
 	.i2c_read_seq = msm_camera_cci_i2c_read_seq,
@@ -113,6 +151,15 @@ static int32_t msm_torch_create_classdev(struct platform_device *pdev,
 				pr_err("Failed to register %d led dev. rc = %d\n",
 						i, rc);
 				return rc;
+			}
+
+			/* 4.9 的 flash_on_off 属性，补回来 */
+			rc = device_create_file(msm_torch_led[i].dev,
+						&dev_attr_flash_on_off);
+			if (rc) {
+				pr_err("Failed to create flash_on_off for %d rc=%d\n",
+				       i, rc);
+				rc = 0;
 			}
 		} else {
 			pr_err("Invalid fctrl->torch_trigger[%d]\n", i);
