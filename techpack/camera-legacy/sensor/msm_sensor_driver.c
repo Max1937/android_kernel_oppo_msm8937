@@ -1018,11 +1018,20 @@ CSID_TG:
 
 	/*
 	 * Update the subdevice id of flash-src based on availability in kernel.
+	 *
+	 * 原来的逻辑：用户态传下来的 flash_name 为空，就把 DT 里
+	 * qcom,led-flash-src 解析出来的 subdev id 抹成 -1。
+	 * 但本机 vendor HAL 根本不填 flash_name（它自己走 /proc/qcom_flash 那一套），
+	 * 结果后摄在 DT 里明明挂了 qcom,led-flash-src，也被判成“没有闪光灯”，
+	 * 框架层 flash.info.available=false，手电筒快捷开关直接拒绝工作。
+	 * DT 说了算：空 flash_name 不再覆盖 DT 结果。
 	 */
-	if (strlen(slave_info->flash_name) == 0) {
+	pr_err("cam_flash_dbg: slot %d sensor %s dt_position %d flash_name '%s' (len %zu) led_flash subdev = %d\n",
+		slave_info->camera_id, slave_info->sensor_name,
+		slave_info->sensor_init_params.position,
+		slave_info->flash_name, strlen(slave_info->flash_name),
 		s_ctrl->sensordata->sensor_info->
-			subdev_id[SUB_MODULE_LED_FLASH] = -1;
-	}
+			subdev_id[SUB_MODULE_LED_FLASH]);
 
 	/*
 	 * Create /dev/videoX node, comment for now until dummy /dev/videoX
