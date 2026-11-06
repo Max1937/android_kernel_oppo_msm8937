@@ -227,6 +227,8 @@ static void qcom_flash_resolve_leds(void)
 
 static void qcom_flash_led_set(int on)
 {
+	enum led_brightness level;
+
 	if (torch_trigger) {
 		led_trigger_event(torch_trigger, on ? LED_FULL : LED_OFF);
 		return;
@@ -236,26 +238,36 @@ static void qcom_flash_led_set(int on)
 		qcom_flash_resolve_leds();
 
 	if (!qcom_torch_led) {
-		pr_err("no torch led found, torch %s ignored\n",
-		       on ? "on" : "off");
+		pr_err("no torch led found, val %d ignored\n", on);
 		return;
 	}
 
-	if (on) {
-		if (qcom_switch_led)
-			led_set_brightness(qcom_switch_led,
-					   qcom_switch_led->max_brightness);
-		led_set_brightness(qcom_torch_led,
-				   qcom_torch_led->max_brightness);
-	} else {
+	if (!on) {
 		led_set_brightness(qcom_torch_led, LED_OFF);
 		if (qcom_switch_led)
 			led_set_brightness(qcom_switch_led, LED_OFF);
+		pr_info("torch off via led_classdev %s\n", qcom_torch_led->name);
+		return;
 	}
 
-	pr_info("torch %s via led_classdev %s (max %d)\n",
-		on ? "on" : "off", qcom_torch_led->name,
-		qcom_torch_led->max_brightness);
+	/*
+	 * 实测：daemon 在开机/会话开始/退出时都会写 5、6 这种小数字，
+	 * 之后不会再写 0（它写完就关 fd，属于 fire-and-forget）。
+	 * 4.9 上从来不会看到灯亮，说明那份驱动是把写入值当“亮度”用的，
+	 * 5/6 也就是亮度 5/6（肉眼几乎不可见），而不是“全亮”。
+	 * 所以这里按亮度映射：>=100 才当作“全亮”的请求。
+	 */
+	level = (on >= 100) ? qcom_torch_led->max_brightness : on;
+	if (level > qcom_torch_led->max_brightness)
+		level = qcom_torch_led->max_brightness;
+
+	if (qcom_switch_led)
+		led_set_brightness(qcom_switch_led,
+				   qcom_switch_led->max_brightness);
+	led_set_brightness(qcom_torch_led, level);
+
+	pr_info("torch level %d -> brightness %d (max %d)\n",
+		on, level, qcom_torch_led->max_brightness);
 }
 
 static void qcom_flash_off_work_fn(struct work_struct *work)
@@ -328,8 +340,11 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 		return orig;
 	}
 
-	/* 非 0 一律给最亮，避免 HAL 传 1 时电流档为 0 反而看不到灯 */
-	qcom_flash_led_set(val ? 1 : 0);
+	/*
+	 * 按写入值当亮度处理：0 灭，1..99 就是那个亮度（daemon 的 5/6 就属于
+	 * 这类“状态写法”，肉眼几乎看不见），>=100 视为全亮请求。
+	 */
+	qcom_flash_led_set((int)val);
 
 	/*
 	 * 看门狗：每次写入都重新计时，非 0 写入超时后自动熄灭，
