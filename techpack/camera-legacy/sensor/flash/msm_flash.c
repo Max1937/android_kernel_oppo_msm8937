@@ -17,8 +17,13 @@
 #include <linux/of_gpio.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
-#include <linux/fs.h>
-#include <linux/cred.h>
+#include <linux/leds.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
+#include <linux/device.h>
+#include <linux/string.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 #include "msm_flash.h"
 #include "msm_camera_dt_util.h"
 #include "msm_cci.h"
@@ -132,46 +137,130 @@ static int qcom_flash_torch_state;
  * 本文件与 drivers/media/platform/msm/camera_v2/sensor/flash/msm_flash.c
  * 是两份同名驱动，实际绑定 qcom,camera-flash 的可能是另一份，那样本文件的
  * 静态 torch_trigger 永远是 NULL（实测：torch-light0 的 trigger 是 [none]，
- * 而 led:torch_0 上是 [torch0_trigger]）。所以 trigger 不可用时直接写
- * qpnp flash LED 的 sysfs，保证手电筒真的能被点亮/熄灭。
+ * 而 led:torch_0 上是 [torch0_trigger]）。
+ *
+ * 兜底不能走 sysfs + filp_open：override_creds(prepare_kernel_cred(NULL))
+ * 之后 SELinux 看到的是 kernel SID，open
+ * /sys/class/leds/led:torch_0/brightness 仍然返回 -EACCES（实测 -13，
+ * 而从 root shell 写同一个节点是成功的）。所以改成在内核里直接拿 LED 对象：
+ *
+ *   qcom,camera-flash 的 qcom,torch-source / qcom,switch-source 是 phandle，
+ *   指向 qcom,qpnp-flash-led 在 leds@d300 下建立的子节点；
+ *   led_classdev_register() 用 device_create_with_groups(..., led_cdev, ...)
+ *   给每个 led 建子设备，drvdata 就是 led_classdev；
+ *   按 DT 的 qcom,led-name 找到 "led:torch_0"/"led:switch" 后直接
+ *   led_set_brightness()，全程不经过 VFS/SELinux/凭据。
  */
+static struct led_classdev *qcom_torch_led;
+static struct led_classdev *qcom_switch_led;
+
+/* 手电筒看门狗：HAL 只负责“开”，收尾经常丢，超过这个时间自动熄灭 */
+#define QCOM_FLASH_TORCH_TIMEOUT_MS 120000
+
+static struct delayed_work qcom_flash_off_work;
+
+struct qcom_led_lookup {
+	const char *name;
+	struct led_classdev *found;
+};
+
+static int qcom_flash_match_led_child(struct device *dev, void *data)
+{
+	struct qcom_led_lookup *lk = data;
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+
+	if (!cdev || !cdev->name)
+		return 0;
+	if (strcmp(cdev->name, lk->name))
+		return 0;
+
+	lk->found = cdev;
+	return 1;
+}
+
+static struct led_classdev *qcom_flash_find_led(const char *prop)
+{
+	struct device_node *flash_np, *led_np;
+	struct platform_device *led_pdev;
+	struct qcom_led_lookup lk = { 0 };
+	const char *name = NULL;
+
+	flash_np = of_find_compatible_node(NULL, NULL, "qcom,camera-flash");
+	if (!flash_np)
+		return NULL;
+
+	led_np = of_parse_phandle(flash_np, prop, 0);
+	of_node_put(flash_np);
+	if (!led_np)
+		return NULL;
+
+	if (of_property_read_string(led_np, "qcom,led-name", &name))
+		name = kbasename(led_np->name);
+	lk.name = name;
+
+	if (led_np->parent) {
+		led_pdev = of_find_device_by_node(led_np->parent);
+		if (led_pdev) {
+			device_for_each_child(&led_pdev->dev, &lk,
+					      qcom_flash_match_led_child);
+			put_device(&led_pdev->dev);
+		}
+	}
+	of_node_put(led_np);
+
+	return lk.found;
+}
+
+static void qcom_flash_resolve_leds(void)
+{
+	if (!qcom_torch_led)
+		qcom_torch_led = qcom_flash_find_led("qcom,torch-source");
+	if (!qcom_switch_led)
+		qcom_switch_led = qcom_flash_find_led("qcom,switch-source");
+
+	pr_info("torch led %s, switch led %s\n",
+		qcom_torch_led ? qcom_torch_led->name : "none",
+		qcom_switch_led ? qcom_switch_led->name : "none");
+}
+
 static void qcom_flash_led_set(int on)
 {
-	struct file *f;
-	const struct cred *old_cred;
-	struct cred *cred;
-	const char *val = on ? "255" : "0";
-	int len = on ? 3 : 1;
-
 	if (torch_trigger) {
 		led_trigger_event(torch_trigger, on ? LED_FULL : LED_OFF);
 		return;
 	}
 
-	/*
-	 * 写 proc 的是 vendor HAL（uid 1000/1047），直接用它的凭据 open
-	 * root:root 0644 的 LED 节点会被 VFS 拒绝（-EACCES，实测 -13），
-	 * 所以临时切到内核 root 凭据再操作。
-	 */
-	cred = prepare_kernel_cred(NULL);
-	if (!cred) {
-		pr_err("%s: no memory for cred\n", __func__);
+	if (!qcom_torch_led)
+		qcom_flash_resolve_leds();
+
+	if (!qcom_torch_led) {
+		pr_err("no torch led found, torch %s ignored\n",
+		       on ? "on" : "off");
 		return;
 	}
-	old_cred = override_creds(cred);
 
-	f = filp_open("/sys/class/leds/led:torch_0/brightness", O_WRONLY, 0);
-	if (IS_ERR(f)) {
-		pr_err("%s: cannot open torch led node (%ld)\n", __func__,
-		       PTR_ERR(f));
+	if (on) {
+		if (qcom_switch_led)
+			led_set_brightness(qcom_switch_led,
+					   qcom_switch_led->max_brightness);
+		led_set_brightness(qcom_torch_led,
+				   qcom_torch_led->max_brightness);
 	} else {
-		kernel_write(f, val, len, &f->f_pos);
-		filp_close(f, NULL);
-		pr_info("%s: torch %s via sysfs\n", __func__, on ? "on" : "off");
+		led_set_brightness(qcom_torch_led, LED_OFF);
+		if (qcom_switch_led)
+			led_set_brightness(qcom_switch_led, LED_OFF);
 	}
 
-	revert_creds(old_cred);
-	put_cred(cred);
+	pr_info("torch %s via led_classdev %s (max %d)\n",
+		on ? "on" : "off", qcom_torch_led->name,
+		qcom_torch_led->max_brightness);
+}
+
+static void qcom_flash_off_work_fn(struct work_struct *work)
+{
+	pr_info("watchdog: torch left on too long, forcing it off\n");
+	qcom_flash_torch_state = 0;
+	qcom_flash_led_set(0);
 }
 
 static ssize_t qcom_flash_proc_read(struct file *file, char __user *buff,
@@ -228,6 +317,15 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 	/* 非 0 一律给最亮，避免 HAL 传 1 时电流档为 0 反而看不到灯 */
 	qcom_flash_led_set(val ? 1 : 0);
 
+	/*
+	 * 看门狗：每次写入都重新计时，非 0 写入超时后自动熄灭，
+	 * 避免 HAL 只写“开”、收尾丢失时把灯一直点着（会烫手又耗电）。
+	 */
+	cancel_delayed_work_sync(&qcom_flash_off_work);
+	if (val)
+		schedule_delayed_work(&qcom_flash_off_work,
+			msecs_to_jiffies(QCOM_FLASH_TORCH_TIMEOUT_MS));
+
 	return orig;
 }
 
@@ -239,6 +337,8 @@ static const struct file_operations qcom_flash_proc_fops = {
 
 static int __init qcom_flash_proc_init(void)
 {
+	INIT_DELAYED_WORK(&qcom_flash_off_work, qcom_flash_off_work_fn);
+
 	if (!proc_create("qcom_flash", 0666, NULL, &qcom_flash_proc_fops)) {
 		pr_err("%s: Error! Couldn't create qcom_flash proc entry\n",
 		       __func__);
