@@ -156,8 +156,7 @@ static struct led_classdev *qcom_switch_led;
 
 /* 手电筒看门狗：HAL 只负责“开”，收尾经常丢，超过这个时间自动熄灭 */
 #define QCOM_FLASH_TORCH_TIMEOUT_MS 300000	/* 正常使用 5 分钟 */
-#define QCOM_FLASH_BOOT_TIMEOUT_MS  15000	/* 开机初始化那几笔，15 秒清掉 */
-#define QCOM_FLASH_BOOT_WINDOW      (180 * HZ)	/* 开机后 3 分钟内算初始化阶段 */
+#define QCOM_FLASH_BOOT_WINDOW      (90 * HZ)	/* 开机 90 秒内忽略“开” */
 
 static unsigned long qcom_flash_init_jiffies;
 static struct delayed_work qcom_flash_off_work;
@@ -317,23 +316,29 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 
 	qcom_flash_torch_state = val ? 1 : 0;
 
+	/*
+	 * 开机阶段（uptime 90 秒内）camera provider 起来时 daemon 会自己写
+	 * 30/35/36 做 flash 初始化，这不是用户在开手电筒；照做会一开机就点亮。
+	 * 这一段直接忽略“开”，只把状态记下来。
+	 */
+	if (val && !time_after(jiffies,
+			       qcom_flash_init_jiffies + QCOM_FLASH_BOOT_WINDOW)) {
+		pr_info("boot window: ignore torch on request (val=%ld)\n", val);
+		qcom_flash_torch_state = 0;
+		return orig;
+	}
+
 	/* 非 0 一律给最亮，避免 HAL 传 1 时电流档为 0 反而看不到灯 */
 	qcom_flash_led_set(val ? 1 : 0);
 
 	/*
 	 * 看门狗：每次写入都重新计时，非 0 写入超时后自动熄灭，
 	 * 避免 HAL 只写“开”、收尾丢失时把灯一直点着（会烫手又耗电）。
-	 *
-	 * 开机阶段（camera provider 起来时）daemon 会自己写 30/35/36 做初始化，
-	 * 这几笔不是用户开的灯，用短超时快速清掉；之后真正的使用给长超时。
 	 */
 	cancel_delayed_work_sync(&qcom_flash_off_work);
 	if (val)
 		schedule_delayed_work(&qcom_flash_off_work,
-			msecs_to_jiffies(time_after(jiffies, qcom_flash_init_jiffies +
-					QCOM_FLASH_BOOT_WINDOW) ?
-				QCOM_FLASH_TORCH_TIMEOUT_MS :
-				QCOM_FLASH_BOOT_TIMEOUT_MS));
+			msecs_to_jiffies(QCOM_FLASH_TORCH_TIMEOUT_MS));
 
 	return orig;
 }
