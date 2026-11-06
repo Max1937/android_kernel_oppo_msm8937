@@ -363,8 +363,17 @@ static int32_t msm_sensor_fill_flash_subdevid_by_name(
 	if (flash_name_len >= MAX_SENSOR_NAME)
 		return -EINVAL;
 
+	/*
+	 * 原逻辑：flash_name 为空就直接 return，subdev_id 停在 -1。
+	 *
+	 * 本机 vendor HAL 根本不用 libflash_*.so 那一套，它自己开
+	 * /proc/qcom_flash，所以 slave_info 里的 flash_name 是空的；结果
+	 * DT 里明明挂在 qcom,camera@0 上的 qcom,led-flash-src 被丢掉，
+	 * 上报给框架的 flash.info.available 就是 false，手电筒开关直接被
+	 * TorchControl 拒绝。DT 说了算：空 flash_name 也继续解析 phandle。
+	 */
 	if (flash_name_len == 0)
-		return 0;
+		pr_info("flash: empty flash_name from HAL, using DT qcom,led-flash-src\n");
 
 	src_node = of_parse_phandle(of_node, "qcom,led-flash-src", 0);
 	if (!src_node) {
@@ -1100,6 +1109,13 @@ CSID_TG:
 
 	s_ctrl->bypass_video_node_creation =
 		slave_info->bypass_video_node_creation;
+
+	pr_err("cam_flash_dbg: slot %d sensor %s dt_position %d flash_name '%s' (len %zu) led_flash subdev = %d\n",
+		slave_info->camera_id, slave_info->sensor_name,
+		slave_info->sensor_init_params.position,
+		slave_info->flash_name, strlen(slave_info->flash_name),
+		s_ctrl->sensordata->sensor_info->
+			subdev_id[SUB_MODULE_LED_FLASH]);
 
 	/*
 	 * Create /dev/videoX node, comment for now until dummy /dev/videoX
