@@ -390,6 +390,27 @@ static int32_t msm_sensor_fill_flash_subdevid_by_name(
 		of_node_put(src_node);
 		src_node = NULL;
 	}
+
+	/*
+	 * 实测（2026-11-06，内核 4.19 + 本机 vendor HAL）：
+	 *   内核按 DT 报 slot0(imx258/后摄)=0、slot1(s5k3p3sp/前摄)=-1，
+	 *   而 HAL 的 static info 恰好相反：
+	 *     legacy/0 Facing Back  flash=false
+	 *     legacy/1 Facing Front flash=true
+	 * 也就是 daemon 把 flash 挂到了另一个 camera id 上。框架据此认为
+	 * 后摄没有闪光灯，手电筒开关直接拒绝（TorchControl: no flash unit）。
+	 *
+	 * 这里把归属反过来报，让“有 flash”的那个 camera id 落到后摄上。
+	 * 仅翻转“有没有”，不改变 flash 子设备本身（还是 led:torch_0）。
+	 */
+	{
+		int32_t before = *flash_subdev_id;
+
+		*flash_subdev_id = (before >= 0) ? -1 : 0;
+		pr_info("flash: slot led_flash subdev %d -> %d (daemon 归属翻转)\n",
+			before, *flash_subdev_id);
+	}
+
 	return rc;
 }
 
