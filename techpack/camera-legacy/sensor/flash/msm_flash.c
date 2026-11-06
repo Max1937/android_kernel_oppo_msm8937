@@ -155,8 +155,11 @@ static struct led_classdev *qcom_torch_led;
 static struct led_classdev *qcom_switch_led;
 
 /* 手电筒看门狗：HAL 只负责“开”，收尾经常丢，超过这个时间自动熄灭 */
-#define QCOM_FLASH_TORCH_TIMEOUT_MS 120000
+#define QCOM_FLASH_TORCH_TIMEOUT_MS 300000	/* 正常使用 5 分钟 */
+#define QCOM_FLASH_BOOT_TIMEOUT_MS  15000	/* 开机初始化那几笔，15 秒清掉 */
+#define QCOM_FLASH_BOOT_WINDOW      (180 * HZ)	/* 开机后 3 分钟内算初始化阶段 */
 
+static unsigned long qcom_flash_init_jiffies;
 static struct delayed_work qcom_flash_off_work;
 
 struct qcom_led_lookup {
@@ -320,11 +323,17 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 	/*
 	 * 看门狗：每次写入都重新计时，非 0 写入超时后自动熄灭，
 	 * 避免 HAL 只写“开”、收尾丢失时把灯一直点着（会烫手又耗电）。
+	 *
+	 * 开机阶段（camera provider 起来时）daemon 会自己写 30/35/36 做初始化，
+	 * 这几笔不是用户开的灯，用短超时快速清掉；之后真正的使用给长超时。
 	 */
 	cancel_delayed_work_sync(&qcom_flash_off_work);
 	if (val)
 		schedule_delayed_work(&qcom_flash_off_work,
-			msecs_to_jiffies(QCOM_FLASH_TORCH_TIMEOUT_MS));
+			msecs_to_jiffies(time_after(jiffies, qcom_flash_init_jiffies +
+					QCOM_FLASH_BOOT_WINDOW) ?
+				QCOM_FLASH_TORCH_TIMEOUT_MS :
+				QCOM_FLASH_BOOT_TIMEOUT_MS));
 
 	return orig;
 }
@@ -337,6 +346,7 @@ static const struct file_operations qcom_flash_proc_fops = {
 
 static int __init qcom_flash_proc_init(void)
 {
+	qcom_flash_init_jiffies = jiffies;
 	INIT_DELAYED_WORK(&qcom_flash_off_work, qcom_flash_off_work_fn);
 
 	if (!proc_create("qcom_flash", 0666, NULL, &qcom_flash_proc_fops)) {
