@@ -24,10 +24,13 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
+#include <linux/power_supply.h>
 
 static struct led_classdev *red_led;
 static struct led_classdev white_led;
 static struct platform_device *notify_parent;
+static struct power_supply *batt_psy;
+static struct notifier_block psy_nb;
 
 static bool blinking;
 static bool blink_phase_on;
@@ -174,6 +177,53 @@ static int notify_match_child(struct device *dev, void *data)
 	return 1;
 }
 
+static void charging_led_update(void)
+{
+	union power_supply_propval val = { 0 };
+	int st;
+
+	if (!batt_psy || !red_led)
+		return;
+	if (power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_STATUS, &val))
+		return;
+	st = val.intval;
+
+	switch (st) {
+	case POWER_SUPPLY_STATUS_CHARGING:
+		blink_freq_ms = 1200;
+		blink_duty = 50;
+		if (!blinking) {
+			blinking = true;
+			blink_phase_on = true;
+			white_brightness_set(&white_led,
+					     white_led.max_brightness);
+			mod_timer(&blink_timer,
+				  jiffies + msecs_to_jiffies(600));
+		}
+		break;
+	case POWER_SUPPLY_STATUS_FULL:
+		blinking = false;
+		del_timer_sync(&blink_timer);
+		white_brightness_set(&white_led, white_led.max_brightness);
+		break;
+	default:
+		blinking = false;
+		del_timer_sync(&blink_timer);
+		white_brightness_set(&white_led, LED_OFF);
+		break;
+	}
+
+	pr_info("oppo_notify: chg status %d -> %s\n", st,
+		blinking ? "breathing" :
+		(st == POWER_SUPPLY_STATUS_FULL ? "steady on" : "off"));
+}
+
+static int psy_notify(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	charging_led_update();
+	return NOTIFY_OK;
+}
+
 static void notify_setup_work_fn(struct work_struct *work)
 {
 	struct device_node *np;
@@ -215,6 +265,14 @@ static void notify_setup_work_fn(struct work_struct *work)
 
 	timer_setup(&blink_timer, blink_timer_fn, 0);
 	INIT_WORK(&blink_work, blink_work_fn);
+
+	batt_psy = power_supply_get_by_name("battery");
+	if (batt_psy) {
+		psy_nb.notifier_call = psy_notify;
+		power_supply_reg_notifier(&psy_nb);
+		charging_led_update();
+	}
+
 	pr_info("oppo_notify: white LED ready (mirrors red, max %d)\n",
 		white_led.max_brightness);
 	return;
@@ -235,6 +293,10 @@ static int __init oppo_notify_init(void)
 static void __exit oppo_notify_exit(void)
 {
 	cancel_delayed_work_sync(&notify_setup_work);
+	blinking = false;
+	del_timer_sync(&blink_timer);
+	if (batt_psy)
+		power_supply_unreg_notifier(&psy_nb);
 	if (notify_parent) {
 		device_remove_file(&notify_parent->dev, &dev_attr_blink);
 		device_remove_file(&notify_parent->dev, &dev_attr_grpfreq);
