@@ -30,22 +30,23 @@ static struct led_classdev *red_led;
 static struct led_classdev white_led;
 static struct platform_device *notify_parent;
 static struct power_supply *batt_psy;
+static struct power_supply *usb_psy;
 static struct notifier_block psy_nb;
 
 static bool blinking;
+static bool charge_breathing;	/* 内核按充电状态强制呼吸中 */
 static bool blink_phase_on;
 static unsigned int blink_freq_ms = 1000;
 static unsigned int blink_duty = 50;
 
 static struct timer_list blink_timer;
 static struct work_struct blink_work;
+static struct work_struct charge_work;
 static struct delayed_work notify_setup_work;
 static int setup_retries;
 
-static void white_brightness_set(struct led_classdev *cdev,
-				 enum led_brightness value)
+static void red_set(enum led_brightness value)
 {
-	pr_info("oppo_notify: white brightness <- %d\n", value);
 	if (!red_led)
 		return;
 	if (red_led->brightness_set)
@@ -54,10 +55,25 @@ static void white_brightness_set(struct led_classdev *cdev,
 		red_led->brightness_set_blocking(red_led, value);
 }
 
+static void white_brightness_set(struct led_classdev *cdev,
+				 enum led_brightness value)
+{
+	pr_info("oppo_notify: white brightness <- %d\n", value);
+	/*
+	 * 充电呼吸由内核自己驱动。框架/HAL 在电池状态变化后还会补一次
+	 * "灭灯"(brightness=0 / blink=0)，实测 62ms 后就把刚点亮的呼吸
+	 * 掐掉。充电期间忽略这类灭灯请求；拔掉后 charge_breathing 清零，
+	 * HAL 恢复正常控制。
+	 */
+	if (charge_breathing && value == LED_OFF)
+		return;
+	red_set(value);
+}
+
 static void blink_work_fn(struct work_struct *w)
 {
-	white_brightness_set(&white_led,
-			     blink_phase_on ? white_led.max_brightness : LED_OFF);
+	/* 定时器内部的明暗切换不走 HAL 入口，避免被上面的忽略逻辑吃掉 */
+	red_set(blink_phase_on ? white_led.max_brightness : LED_OFF);
 }
 
 static void blink_timer_fn(struct timer_list *t)
@@ -102,6 +118,10 @@ static ssize_t blink_store(struct device *dev, struct device_attribute *attr,
 			mod_timer(&blink_timer, jiffies + msecs_to_jiffies(200));
 		}
 	} else {
+		if (charge_breathing) {
+			pr_info("oppo_notify: ignore HAL blink off while charging\n");
+			return count;
+		}
 		blinking = false;
 		del_timer_sync(&blink_timer);
 		white_brightness_set(&white_led, LED_OFF);
@@ -180,16 +200,45 @@ static int notify_match_child(struct device *dev, void *data)
 static void charging_led_update(void)
 {
 	union power_supply_propval val = { 0 };
-	int st;
+	int online = 0, capacity = -1;
 
-	if (!batt_psy || !red_led)
+	if (!red_led)
 		return;
-	if (power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_STATUS, &val))
-		return;
-	st = val.intval;
 
-	switch (st) {
-	case POWER_SUPPLY_STATUS_CHARGING:
+	/*
+	 * 这台 4.19 移植的 battery psy 在插 USB 时仍报 Discharging
+	 * (POWER_SUPPLY_STATUS 不更新、current_now 为负)，用 STATUS 判断
+	 * 充电永远不成立，所以充电呼吸从不启动。改用 usb psy 的 ONLINE
+	 * 加 battery 的 CAPACITY：
+	 *   online=1, cap<100  -> 充电中，呼吸 (1.2s)
+	 *   online=1, cap>=100 -> 充满，常亮
+	 *   online=0           -> 未充电，灭灯并交还 HAL 控制
+	 * usb psy 可能晚于本驱动注册，拿不到就每次回调再试。
+	 */
+	if (!usb_psy)
+		usb_psy = power_supply_get_by_name("usb");
+	if (usb_psy &&
+	    !power_supply_get_property(usb_psy, POWER_SUPPLY_PROP_ONLINE, &val))
+		online = val.intval;
+	if (!batt_psy)
+		batt_psy = power_supply_get_by_name("battery");
+	if (batt_psy &&
+	    !power_supply_get_property(batt_psy, POWER_SUPPLY_PROP_CAPACITY,
+				       &val))
+		capacity = val.intval;
+
+	if (!online) {
+		charge_breathing = false;
+		blinking = false;
+		del_timer_sync(&blink_timer);
+		white_brightness_set(&white_led, LED_OFF);
+	} else if (capacity >= 100) {
+		charge_breathing = true;
+		blinking = false;
+		del_timer_sync(&blink_timer);
+		white_brightness_set(&white_led, white_led.max_brightness);
+	} else {
+		charge_breathing = true;
 		blink_freq_ms = 1200;
 		blink_duty = 50;
 		if (!blinking) {
@@ -200,27 +249,22 @@ static void charging_led_update(void)
 			mod_timer(&blink_timer,
 				  jiffies + msecs_to_jiffies(600));
 		}
-		break;
-	case POWER_SUPPLY_STATUS_FULL:
-		blinking = false;
-		del_timer_sync(&blink_timer);
-		white_brightness_set(&white_led, white_led.max_brightness);
-		break;
-	default:
-		blinking = false;
-		del_timer_sync(&blink_timer);
-		white_brightness_set(&white_led, LED_OFF);
-		break;
 	}
 
-	pr_info("oppo_notify: chg status %d -> %s\n", st,
+	pr_info("oppo_notify: chg online=%d cap=%d -> %s\n", online, capacity,
 		blinking ? "breathing" :
-		(st == POWER_SUPPLY_STATUS_FULL ? "steady on" : "off"));
+		(charge_breathing ? "steady on" : "off"));
+}
+
+static void charge_work_fn(struct work_struct *w)
+{
+	charging_led_update();
 }
 
 static int psy_notify(struct notifier_block *nb, unsigned long event, void *ptr)
 {
-	charging_led_update();
+	/* power_supply notifier 可能在原子上下文；真正的 LED 操作放 work 里 */
+	schedule_work(&charge_work);
 	return NOTIFY_OK;
 }
 
@@ -265,13 +309,13 @@ static void notify_setup_work_fn(struct work_struct *work)
 
 	timer_setup(&blink_timer, blink_timer_fn, 0);
 	INIT_WORK(&blink_work, blink_work_fn);
+	INIT_WORK(&charge_work, charge_work_fn);
 
 	batt_psy = power_supply_get_by_name("battery");
-	if (batt_psy) {
-		psy_nb.notifier_call = psy_notify;
-		power_supply_reg_notifier(&psy_nb);
-		charging_led_update();
-	}
+	usb_psy = power_supply_get_by_name("usb");
+	psy_nb.notifier_call = psy_notify;
+	power_supply_reg_notifier(&psy_nb);
+	charging_led_update();
 
 	pr_info("oppo_notify: white LED ready (mirrors red, max %d)\n",
 		white_led.max_brightness);
@@ -293,6 +337,8 @@ static int __init oppo_notify_init(void)
 static void __exit oppo_notify_exit(void)
 {
 	cancel_delayed_work_sync(&notify_setup_work);
+	cancel_work_sync(&charge_work);
+	cancel_work_sync(&blink_work);
 	blinking = false;
 	del_timer_sync(&blink_timer);
 	if (batt_psy)
