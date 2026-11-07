@@ -1443,16 +1443,20 @@ static int mdss_dsi_off(struct mdss_panel_data *pdata, int power_state)
 	 * controller config fails (status 0x1b) and the video engine timegen
 	 * never starts, so vsync poll times out and only the backlight comes
 	 * on after resume. The only working display link is the one inherited
-	 * from lk2nd at boot through continuous splash (ctrl_state stays
-	 * DSI_ACTIVE, PHY and panel power kept on). Preserve that link across
-	 * suspend by skipping the controller/PHY/clock/panel teardown here;
-	 * the matching mdss_dsi_on() cont_splash guard then keeps it intact on
-	 * resume instead of re-running the broken init sequence.
+	 * from lk2nd at boot through continuous splash (ctrl_state keeps
+	 * CTRL_STATE_DSI_ACTIVE set). Preserve that link across suspend by
+	 * skipping the controller/PHY/clock/panel teardown whenever that bit is
+	 * still set; the matching mdss_dsi_on() cont_splash guard then keeps it
+	 * intact on resume instead of re-running the broken init sequence.
 	 */
-	if (panel_info->cont_splash_enabled &&
-	    mdss_dsi_is_panel_on_interactive(pdata)) {
-		pr_info("%s: cont_splash link, keep DSI active across suspend\n",
-			__func__);
+	/*
+	 * The inherited lk2nd/cont-splash DSI link is the only working display
+	 * path on this device. ctrl_state keeps CTRL_STATE_DSI_ACTIVE set from
+	 * boot; as long as that bit is set the link is live, so skip the entire
+	 * controller/PHY/clock/panel teardown here and let it survive suspend.
+	 */
+	if (ctrl_pdata->ctrl_state & CTRL_STATE_DSI_ACTIVE) {
+		pr_info("%s: DSI_ACTIVE kept, skip suspend teardown\n", __func__);
 		goto end;
 	}
 
