@@ -1571,6 +1571,17 @@ static int mdss_fb_suspend_sub(struct msm_fb_data_type *mfd)
 	if ((!mfd) || (mfd->key != MFD_KEY))
 		return 0;
 
+	/*
+	 * On this device the DSI re-init after blank is broken and the only
+	 * working display path is the lk2nd/cont-splash link kept alive from
+	 * boot. Do not touch MDP/DSI clocks or the panel on suspend; leave
+	 * everything exactly as lk2nd set it so the screen survives suspend.
+	 */
+	if (mfd->panel_info->cont_splash_enabled) {
+		fb_set_suspend(mfd->fbi, FBINFO_STATE_SUSPENDED);
+		return 0;
+	}
+
 	pr_debug("mdss_fb suspend index=%d\n", mfd->index);
 
 	ret = mdss_fb_pan_idle(mfd);
@@ -1617,6 +1628,18 @@ static int mdss_fb_resume_sub(struct msm_fb_data_type *mfd)
 
 	if ((!mfd) || (mfd->key != MFD_KEY))
 		return 0;
+
+	/*
+	 * Symmetric to suspend: with cont-splash the link is never taken
+	 * down, so resume has nothing to re-init. Just release the power
+	 * setting barrier and mark the fb running again.
+	 */
+	if (mfd->panel_info->cont_splash_enabled) {
+		mfd->is_power_setting = false;
+		complete_all(&mfd->power_set_comp);
+		fb_set_suspend(mfd->fbi, FBINFO_STATE_RUNNING);
+		return 0;
+	}
 
 	reinit_completion(&mfd->power_set_comp);
 	mfd->is_power_setting = true;
