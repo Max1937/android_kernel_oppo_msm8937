@@ -154,8 +154,16 @@ static int qcom_flash_torch_state;
 static struct led_classdev *qcom_torch_led;
 static struct led_classdev *qcom_switch_led;
 
-/* 手电筒看门狗：HAL 只负责“开”，收尾经常丢，超过这个时间自动熄灭 */
-#define QCOM_FLASH_TORCH_TIMEOUT_MS 300000	/* 正常使用 5 分钟 */
+/*
+ * 手电筒看门狗：HAL 只负责“开”，收尾经常丢（退出相机时 0 不写回来），
+ * 超过窗口就自动熄灭，避免灯一直亮烫手。
+ *   - 小数值(5/6，相机预览手电筒)用短窗口：退出相机后最多亮 ~30 秒，
+ *     不再出现“一直亮”。
+ *   - 大数值(>=100，系统手电筒全亮请求)保持长窗口，交给用户自己关，
+ *     不被看门狗误杀。
+ */
+#define QCOM_FLASH_TORCH_TIMEOUT_SML_MS 30000	/* 相机预览手电筒：30 秒 */
+#define QCOM_FLASH_TORCH_TIMEOUT_BIG_MS 300000	/* 系统全亮手电筒：5 分钟 */
 #define QCOM_FLASH_BOOT_WINDOW      (90 * HZ)	/* 开机 90 秒内忽略“开” */
 
 static unsigned long qcom_flash_init_jiffies;
@@ -355,13 +363,19 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 	qcom_flash_led_set((int)val);
 
 	/*
-	 * 看门狗：每次写入都重新计时，非 0 写入超时后自动熄灭，
+	 * 看门狗：每次写入都重新计时，超时后自动熄灭，
 	 * 避免 HAL 只写“开”、收尾丢失时把灯一直点着（会烫手又耗电）。
+	 *   - 小数值(5/6，相机预览手电筒)用短窗口：退出相机后最多亮 ~30 秒，
+	 *     不再出现“一直亮”。
+	 *   - 大数值(>=100，系统全亮手电筒)保持长窗口，交给用户自己关，
+	 *     不被看门狗误杀。
 	 */
 	cancel_delayed_work_sync(&qcom_flash_off_work);
 	if (val)
 		schedule_delayed_work(&qcom_flash_off_work,
-			msecs_to_jiffies(QCOM_FLASH_TORCH_TIMEOUT_MS));
+			msecs_to_jiffies(val >= 100 ?
+				QCOM_FLASH_TORCH_TIMEOUT_BIG_MS :
+				QCOM_FLASH_TORCH_TIMEOUT_SML_MS));
 
 	return orig;
 }
