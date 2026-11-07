@@ -357,25 +357,28 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 	}
 
 	/*
-	 * 按写入值当亮度处理：0 灭，1..99 就是那个亮度（daemon 的 5/6 就属于
-	 * 这类“状态写法”，肉眼几乎看不见），>=100 视为全亮请求。
+	 * 真实手电筒请求（系统磁贴 / 框架 setTorchMode）用 >=100 的大值
+	 * （实测 200/255 全亮）；相机 HAL 在 open / preview 初始化时写的 5、6
+	 * 这类小值，本意是“闪光灯能力 / 状态初始化”，4.9 上并不会点亮成手电筒。
+	 * 这里只把 >=100 当作点亮，小值直接忽略，彻底避免
+	 * “一打开相机手电筒就自己亮”的现象。
+	 * 0 永远是灭灯，谁写都认。
 	 */
-	qcom_flash_led_set((int)val);
-
-	/*
-	 * 看门狗：每次写入都重新计时，超时后自动熄灭，
-	 * 避免 HAL 只写“开”、收尾丢失时把灯一直点着（会烫手又耗电）。
-	 *   - 小数值(5/6，相机预览手电筒)用短窗口：退出相机后最多亮 ~30 秒，
-	 *     不再出现“一直亮”。
-	 *   - 大数值(>=100，系统全亮手电筒)保持长窗口，交给用户自己关，
-	 *     不被看门狗误杀。
-	 */
-	cancel_delayed_work_sync(&qcom_flash_off_work);
-	if (val)
+	if (val == 0) {
+		qcom_flash_led_set(0);
+		cancel_delayed_work_sync(&qcom_flash_off_work);
+	} else if (val >= 100) {
+		qcom_flash_led_set((int)val);
+		/*
+		 * 看门狗：全亮手电筒交给用户自己关，用长窗口（5 分钟），
+		 * 不被误杀。
+		 */
+		cancel_delayed_work_sync(&qcom_flash_off_work);
 		schedule_delayed_work(&qcom_flash_off_work,
-			msecs_to_jiffies(val >= 100 ?
-				QCOM_FLASH_TORCH_TIMEOUT_BIG_MS :
-				QCOM_FLASH_TORCH_TIMEOUT_SML_MS));
+			msecs_to_jiffies(QCOM_FLASH_TORCH_TIMEOUT_BIG_MS));
+	} else {
+		pr_info("small val %ld treated as camera init, torch not lit\n", val);
+	}
 
 	return orig;
 }
