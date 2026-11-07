@@ -1438,6 +1438,25 @@ static int mdss_dsi_off(struct mdss_panel_data *pdata, int power_state)
 	}
 
 	/*
+	 * On this device the kernel's standalone DSI re-init after suspend
+	 * is broken: the HS byte-clock set_rate returns -EINVAL, the DSI
+	 * controller config fails (status 0x1b) and the video engine timegen
+	 * never starts, so vsync poll times out and only the backlight comes
+	 * on after resume. The only working display link is the one inherited
+	 * from lk2nd at boot through continuous splash (ctrl_state stays
+	 * DSI_ACTIVE, PHY and panel power kept on). Preserve that link across
+	 * suspend by skipping the controller/PHY/clock/panel teardown here;
+	 * the matching mdss_dsi_on() cont_splash guard then keeps it intact on
+	 * resume instead of re-running the broken init sequence.
+	 */
+	if (panel_info->cont_splash_enabled &&
+	    mdss_dsi_is_panel_on_interactive(pdata)) {
+		pr_info("%s: cont_splash link, keep DSI active across suspend\n",
+			__func__);
+		goto end;
+	}
+
+	/*
 	 * Link clocks should be turned off before PHY can be disabled.
 	 * For command mode panels, all clocks are turned off prior to reaching
 	 * here, so core clocks should be turned on before accessing hardware
