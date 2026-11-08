@@ -367,8 +367,16 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 	if (val == 0) {
 		qcom_flash_led_set(0);
 		cancel_delayed_work_sync(&qcom_flash_off_work);
-	} else if (val >= 100) {
-		qcom_flash_led_set((int)val);
+	} else if (val == 1 || val >= 100) {
+		/*
+		 * 实测 HAL 协议（dmesg 抓到的原始字节）：
+		 *   开手电筒  -> 先写 5，再写 1
+		 *   关手电筒  -> 先写 0，再写 6
+		 *   打开相机  -> 只写 5、6（没有 1）
+		 * 所以 1 就是 torch enable；>=100 是框架直接给的亮度档位。
+		 * 两者都点灯，1 用最大亮度。
+		 */
+		qcom_flash_led_set((val == 1) ? 255 : (int)val);
 		/*
 		 * 看门狗：全亮手电筒交给用户自己关，用长窗口（5 分钟），
 		 * 不被误杀。
