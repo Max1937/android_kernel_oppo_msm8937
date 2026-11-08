@@ -2092,19 +2092,6 @@ static int mdss_fb_blank_unblank(struct msm_fb_data_type *mfd)
 	if (!mfd)
 		return -EINVAL;
 
-	if (mfd->index == 0) {
-		/* 对应 blank：链路没断，只把背光恢复回去 */
-		pr_info("%s: restore backlight only\n", __func__);
-		mutex_lock(&mfd->bl_lock);
-		if (!mfd->allow_bl_update && mfd->unset_bl_level != U32_MAX) {
-			mfd->allow_bl_update = true;
-			mdss_fb_set_backlight(mfd, mfd->unset_bl_level);
-			mfd->allow_bl_update = false;
-		}
-		mutex_unlock(&mfd->bl_lock);
-		return 0;
-	}
-
 	if (mfd->panel_info->debugfs_info)
 		mdss_panel_validate_debugfs_info(mfd);
 
@@ -2120,6 +2107,22 @@ static int mdss_fb_blank_unblank(struct msm_fb_data_type *mfd)
 		MDSS_PANEL_POWER_ON);
 
 	if (mdss_panel_is_power_on_interactive(cur_power_state)) {
+		/*
+		 * 面板链路一直是通的（息屏时只关了背光，没走 off_fnc），
+		 * 所以这里不用重新初始化，只要把背光恢复回去。
+		 * 注意不能在这里整体 return，上面的 disp_thread 启动
+		 * 和首次 on_fnc 是开机出图必须的。
+		 */
+		if (mfd->index == 0) {
+			mutex_lock(&mfd->bl_lock);
+			if (!mfd->allow_bl_update &&
+			    mfd->unset_bl_level != U32_MAX) {
+				mfd->allow_bl_update = true;
+				mdss_fb_set_backlight(mfd, mfd->unset_bl_level);
+				mfd->allow_bl_update = false;
+			}
+			mutex_unlock(&mfd->bl_lock);
+		}
 		pr_debug("No change in power state\n");
 		return 0;
 	}
