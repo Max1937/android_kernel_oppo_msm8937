@@ -1577,10 +1577,20 @@ static int mdss_fb_suspend_sub(struct msm_fb_data_type *mfd)
 	 * boot. Do not touch MDP/DSI clocks or the panel on suspend; leave
 	 * everything exactly as lk2nd set it so the screen survives suspend.
 	 */
-	if (mfd->panel_info->cont_splash_enabled) {
-		fb_set_suspend(mfd->fbi, FBINFO_STATE_SUSPENDED);
-		return 0;
-	}
+	/*
+	 * 本机面板是 oppo16061boe nt35521s 720p video mode，设备树里没有
+	 * cont-splash 属性，所以下面这些“保持链路”的保护原先全是死代码。
+	 * 实测：只要走完整的 MDP/DSI 关断，on_fnc() 的重新初始化就是坏的
+	 * （byte clock set_rate 返回 -EINVAL、控制器配置 status 0x1b、
+	 * timegen 起不来、vsync 超时），息屏一次后屏幕永久黑掉，连背光都
+	 * 不再响应，只能重启恢复。
+	 * 因此本机策略：显示硬件从开机起永不关断，屏幕的“关”只体现为背光
+	 * 归零，唤醒就是把背光恢复回去。
+	 */
+	pr_info("%s: keep display alive across suspend (index=%d)\n",
+		__func__, mfd->index);
+	fb_set_suspend(mfd->fbi, FBINFO_STATE_SUSPENDED);
+	return 0;
 
 	pr_debug("mdss_fb suspend index=%d\n", mfd->index);
 
@@ -1634,12 +1644,22 @@ static int mdss_fb_resume_sub(struct msm_fb_data_type *mfd)
 	 * down, so resume has nothing to re-init. Just release the power
 	 * setting barrier and mark the fb running again.
 	 */
-	if (mfd->panel_info->cont_splash_enabled) {
-		mfd->is_power_setting = false;
-		complete_all(&mfd->power_set_comp);
-		fb_set_suspend(mfd->fbi, FBINFO_STATE_RUNNING);
-		return 0;
-	}
+	/*
+	 * 本机面板是 oppo16061boe nt35521s 720p video mode，设备树里没有
+	 * cont-splash 属性，所以下面这些“保持链路”的保护原先全是死代码。
+	 * 实测：只要走完整的 MDP/DSI 关断，on_fnc() 的重新初始化就是坏的
+	 * （byte clock set_rate 返回 -EINVAL、控制器配置 status 0x1b、
+	 * timegen 起不来、vsync 超时），息屏一次后屏幕永久黑掉，连背光都
+	 * 不再响应，只能重启恢复。
+	 * 因此本机策略：显示硬件从开机起永不关断，屏幕的“关”只体现为背光
+	 * 归零，唤醒就是把背光恢复回去。
+	 */
+	pr_info("%s: display never went down, just resume fb (index=%d)\n",
+		__func__, mfd->index);
+	mfd->is_power_setting = false;
+	complete_all(&mfd->power_set_comp);
+	fb_set_suspend(mfd->fbi, FBINFO_STATE_RUNNING);
+	return 0;
 
 	reinit_completion(&mfd->power_set_comp);
 	mfd->is_power_setting = true;
@@ -2003,6 +2023,19 @@ static int mdss_fb_blank_blank(struct msm_fb_data_type *mfd,
 	if (!mfd)
 		return -EINVAL;
 
+	if (mfd->index == 0) {
+		/* 只关背光，MDP/DSI/面板原样保留 */
+		pr_info("%s: backlight off only, keep mdp/dsi alive\n", __func__);
+		mutex_lock(&mfd->bl_lock);
+		current_bl = mfd->bl_level;
+		mfd->allow_bl_update = true;
+		mdss_fb_set_backlight(mfd, 0);
+		mfd->allow_bl_update = false;
+		mfd->unset_bl_level = current_bl;
+		mutex_unlock(&mfd->bl_lock);
+		return 0;
+	}
+
 	if (!mdss_fb_is_power_on(mfd) || !mfd->mdp.off_fnc)
 		return 0;
 
@@ -2058,6 +2091,19 @@ static int mdss_fb_blank_unblank(struct msm_fb_data_type *mfd)
 
 	if (!mfd)
 		return -EINVAL;
+
+	if (mfd->index == 0) {
+		/* 对应 blank：链路没断，只把背光恢复回去 */
+		pr_info("%s: restore backlight only\n", __func__);
+		mutex_lock(&mfd->bl_lock);
+		if (!mfd->allow_bl_update && mfd->unset_bl_level != U32_MAX) {
+			mfd->allow_bl_update = true;
+			mdss_fb_set_backlight(mfd, mfd->unset_bl_level);
+			mfd->allow_bl_update = false;
+		}
+		mutex_unlock(&mfd->bl_lock);
+		return 0;
+	}
 
 	if (mfd->panel_info->debugfs_info)
 		mdss_panel_validate_debugfs_info(mfd);
