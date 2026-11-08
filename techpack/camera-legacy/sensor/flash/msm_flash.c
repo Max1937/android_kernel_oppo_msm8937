@@ -345,18 +345,6 @@ static ssize_t qcom_flash_proc_write(struct file *file,
 	qcom_flash_torch_state = val ? 1 : 0;
 
 	/*
-	 * 开机阶段（uptime 90 秒内）camera provider 起来时 daemon 会自己写
-	 * 30/35/36 做 flash 初始化，这不是用户在开手电筒；照做会一开机就点亮。
-	 * 这一段直接忽略“开”，只把状态记下来。
-	 */
-	if (val && !time_after(jiffies,
-			       qcom_flash_init_jiffies + QCOM_FLASH_BOOT_WINDOW)) {
-		pr_info("boot window: ignore torch on request (val=%ld)\n", val);
-		qcom_flash_torch_state = 0;
-		return orig;
-	}
-
-	/*
 	 * 真实手电筒请求（系统磁贴 / 框架 setTorchMode）用 >=100 的大值
 	 * （实测 200/255 全亮）；相机 HAL 在 open / preview 初始化时写的 5、6
 	 * 这类小值，本意是“闪光灯能力 / 状态初始化”，4.9 上并不会点亮成手电筒。
