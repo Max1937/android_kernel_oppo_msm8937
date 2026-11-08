@@ -2377,6 +2377,21 @@ static int mdss_dsi_cmd_dma_tx(struct mdss_dsi_ctrl_pdata *ctrl,
 		goto end;
 	}
 
+	/*
+	 * Video mode: the CMD_DMA_DONE interrupt never fires for DCS commands
+	 * (the driver already masks the overflow ISR when ignored is set), so
+	 * waiting here only costs DMA_TX_TIMEOUT (200 ms) per command. On
+	 * resume the panel-on DCS sequence sends 0xff and 0x53, which delayed
+	 * the backlight update by ~600 ms and made the screen look dead on the
+	 * first power-button press. The command has already been triggered
+	 * above; just report success without waiting for a completion that
+	 * cannot arrive.
+	 */
+	if (ignored) {
+		ret = tp->len;
+		goto end;
+	}
+
 	ret = wait_for_completion_timeout(&ctrl->dma_comp,
 				msecs_to_jiffies(DMA_TX_TIMEOUT));
 	if (ret == 0) {
